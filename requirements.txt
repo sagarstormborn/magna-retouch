@@ -11,7 +11,10 @@ lensfunpy==1.13.0
 colour-science==0.4.4
 scikit-image==0.23.2
 
-# Deep learning (PyTorch — CPU+CUDA unified wheel)
+# Deep learning — install torch BEFORE this file via the correct index:
+#   CPU:  pip install torch==2.3.0 torchvision==0.18.0 --index-url https://download.pytorch.org/whl/cpu
+#   CUDA: pip install torch==2.3.0 torchvision==0.18.0 --index-url https://download.pytorch.org/whl/cu121
+# Both targets are handled in Dockerfile and setup.sh. Listing here just for auditing.
 torch==2.3.0
 torchvision==0.18.0
 

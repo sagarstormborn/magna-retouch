@@ -39,7 +39,8 @@ def process(images: list[np.ndarray], cfg: dict) -> np.ndarray:
 def _align(images: list[np.ndarray], method: str) -> list[np.ndarray]:
     if method == "MTB":
         aligner = cv2.createAlignMTB()
-        aligned = list(images)
+        # Deep-copy inputs: MTB modifies arrays in-place when src==dst
+        aligned = [img.copy() for img in images]
         aligner.process(aligned, aligned)
         return aligned
 
@@ -76,8 +77,10 @@ def _mertens_fuse(images: list[np.ndarray], weights: dict) -> np.ndarray:
         saturation_weight=float(weights["saturation"]),
         exposure_weight=float(weights["exposure"]),
     )
-    # Mertens expects uint8 or float32 0-1; feed float32 from uint16
-    f32_list = [uint16_to_float(img) for img in images]
+    # OpenCV 4.9+ MergeMertens treats float32 inputs as [0, 255] scale and
+    # returns [0, 1]. Scale accordingly; clip to avoid artefacts on over-exposed
+    # pixels that exceed 255 after EV scaling.
+    f32_list = [np.clip(uint16_to_float(img) * 255.0, 0, 255) for img in images]
     fused = merge.process(f32_list)   # returns float32 [0,1]
     return fused
 

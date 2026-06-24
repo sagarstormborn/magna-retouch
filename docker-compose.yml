@@ -1,0 +1,41 @@
+services:
+
+  # ── CPU: benchmarking, Stage 1-3, CI ────────────────────────────────────────
+  pipeline-cpu:
+    build:
+      context: .
+      target: cpu
+    image: magna-retouch:cpu
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./logs:/app/logs
+      - ./configs:/app/configs
+    environment:
+      - PYTHONPATH=/app
+
+  # ── GPU: Stage 4 LUT training + inference ───────────────────────────────────
+  pipeline-gpu:
+    build:
+      context: .
+      target: gpu
+    image: magna-retouch:gpu
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - PYTHONPATH=/app
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./logs:/app/logs
+      - ./configs:/app/configs
+
+  # ── Tests (CPU, no data mounts needed) ───────────────────────────────────────
+  test:
+    build:
+      context: .
+      target: cpu
+    image: magna-retouch:cpu
+    command: ["python", "-m", "pytest", "tests/", "-v", "--tb=short"]
+    environment:
+      - PYTHONPATH=/app
