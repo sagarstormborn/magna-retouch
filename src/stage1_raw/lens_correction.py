@@ -35,6 +35,8 @@ def correct_lens(
     """
     Apply vignetting → TCA → geometry correction.
     Returns the corrected image (same dtype as input) or the original on lookup failure.
+    lensfunpy's apply_color_modification only accepts float32/float64/uint8,
+    so we work in float32 throughout and round-trip back to the original dtype.
     """
     db = lensfunpy.Database()
     cam, lens = _lookup(db, exif, loose_search_fallback)
@@ -51,27 +53,37 @@ def correct_lens(
 
     interp_flag = _INTERP.get(interpolation, cv2.INTER_LANCZOS4)
 
-    # 1. Vignetting (pixel-space multiplication — no remap needed)
-    if mod.apply_color_modification(img):
-        pass  # applied in-place
+    # Work in float32 — lensfunpy does not support uint16
+    original_dtype = img.dtype
+    scale = 65535.0 if original_dtype == np.uint16 else 1.0
+    work = img.astype(np.float32) / scale
+
+    # 1. Vignetting (in-place on float32)
+    mod.apply_color_modification(work)
 
     # 2. TCA (per-channel remap)
     tca_coords = mod.apply_subpixel_distortion()
     if tca_coords is not None:
-        img = _remap_subpixel(img, tca_coords, interp_flag)
+        work = _remap_subpixel(work, tca_coords, interp_flag)
 
     # 3. Geometry distortion
     geo_coords = mod.apply_geometry_distortion()
     if geo_coords is not None:
-        img = cv2.remap(img, geo_coords, None, interp_flag)
+        work = cv2.remap(work, geo_coords, None, interp_flag)
 
     log.info("lens_correction.ok", camera=exif.get("camera_model"), lens=str(lens))
-    return img
+
+    result = np.clip(work * scale, 0, scale).astype(original_dtype)
+    return result
 
 
 def _lookup(db, exif: dict, loose: bool) -> tuple[Optional[object], Optional[object]]:
     make = exif.get("camera_make", "")
     model = exif.get("camera_model", "")
+
+    # Don't attempt a lookup with empty strings — lensfunpy returns arbitrary results
+    if not make or not model:
+        return None, None
 
     cams = db.find_cameras(make, model)
     if not cams:

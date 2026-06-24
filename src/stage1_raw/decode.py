@@ -38,19 +38,20 @@ def decode_raw(path: Path, half_size: bool = False) -> tuple[np.ndarray, dict]:
 
 
 def _extract_exif(raw: rawpy.RawPy) -> dict:
-    try:
-        d = raw.raw_image_visible  # noqa: access just to confirm readable
-    except Exception:
-        pass
-
     exif: dict = {}
     try:
-        exif["camera_make"] = raw.metadata.make.strip()
-        exif["camera_model"] = raw.metadata.model.strip()
-        exif["focal_length"] = raw.metadata.focal_len
-        exif["aperture"] = raw.metadata.aperture
-        exif["shutter_speed"] = raw.metadata.shutter
-        exif["iso"] = raw.metadata.iso_speed
+        # Camera make/model live in raw.lens (rawpy ≥ 0.20)
+        exif["camera_make"] = (raw.lens.make or "").strip()
+        exif["camera_model"] = (raw.lens.model or "").strip()
+    except Exception:
+        pass
+    try:
+        # Exposure metadata in raw.other
+        other = raw.other
+        exif["focal_length"] = getattr(other, "focal_length", None)
+        exif["aperture"] = getattr(other, "aperture", None)
+        exif["shutter_speed"] = getattr(other, "shutter_speed", None)
+        exif["iso"] = getattr(other, "iso_speed", None)
     except Exception:
         pass
     return exif
