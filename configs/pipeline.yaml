@@ -1,0 +1,60 @@
+stage1_raw:
+  demosaic_algorithm: AHD          # AHD | DHT | AAHD
+  output_bps: 16
+  denoise_enabled: false           # OFF by default — Mertens averages noise
+  denoise_model: nafnet            # nafnet only escalation path
+  lens_correction:
+    enabled: true
+    loose_search_fallback: true    # retry with loose_search=True before giving up
+    interpolation: LANCZOS4
+
+stage2_hdr:
+  align_method: MTB                # MTB | ECC
+  fusion_method: mertens
+  mertens_weights:
+    contrast: 1.0
+    saturation: 1.0
+    exposure: 1.0
+  single_shot_itm: false           # OFF — needs client sign-off; can hallucinate
+
+stage3_wb:
+  estimator: shades_of_gray        # shades_of_gray | mixed_illuminant (RED: needs license)
+  series_lock: true                # robust median across property set
+  target_cct_k: 5500               # target correlated colour temperature (neutral-warm)
+  per_room_override: false
+
+stage4_look:
+  method: lut3d                    # lut3d | hdrnet
+  lut_size: 33
+  lut_model_path: models/lut3d/model_best.pth
+  hdrnet_model_path: models/hdrnet/model_best.pth
+  train:
+    n_epochs: 400
+    lr: 0.0001
+    batch_size: 1
+    train_size: 480
+
+stage5_benchmark:
+  delta_e_threshold: 2.0           # ΔE2000 target ≲ 2 (Matt criterion 3)
+  ms_ssim_threshold: 0.90
+  lpips_threshold: 0.15
+  wb_variance_threshold: 50        # max CCT swing across a property series
+  highlight_protection_stops: 2    # top-2-stops must not clip (Matt requirement)
+  contact_sheet:
+    enabled: true
+    output_dir: logs/contact_sheets
+    labels:
+      - Input
+      - Ours
+      - Autoenhance
+      - "Matt's Reference"
+
+io:
+  raw_extensions: [".nef", ".cr2", ".cr3", ".arw", ".dng", ".raf", ".orf", ".rw2"]
+  output_format: tiff              # tiff | jpeg
+  output_quality: 95               # JPEG only
+  output_bit_depth: 16
+
+logging:
+  level: INFO
+  log_dir: logs

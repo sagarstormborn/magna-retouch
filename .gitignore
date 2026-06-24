@@ -1,0 +1,15 @@
+data/
+models/weights/
+logs/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.DS_Store
+*.so
+*.pyd
+trilinear_cpp/build/
