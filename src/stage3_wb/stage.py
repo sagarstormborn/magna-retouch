@@ -4,7 +4,7 @@ import numpy as np
 import structlog
 
 from src.common.io import uint16_to_float
-from .estimator import shades_of_gray, apply_wb, series_illuminant
+from .estimator import shades_of_gray, full_illuminant, apply_wb, series_illuminant
 
 log = structlog.get_logger(__name__)
 
@@ -12,16 +12,23 @@ log = structlog.get_logger(__name__)
 def process_series(
     images: list[np.ndarray],
     cfg: dict,
+    exif_list: list[dict] | None = None,
     per_room_overrides: dict | None = None,
 ) -> list[np.ndarray]:
     """
     Apply WB to an entire property series with a single locked illuminant.
+    exif_list: per-image EXIF dicts (containing daylight_wb); if None, falls back
+               to Shades-of-Gray only.
     per_room_overrides: {index: illuminant_3vec} to override specific rooms.
     Returns list of uint16 WB-corrected images.
     """
     s3 = cfg["stage3_wb"]
+    exif_list = exif_list or [{}] * len(images)
 
-    illuminants = [shades_of_gray(uint16_to_float(img)) for img in images]
+    illuminants = [
+        full_illuminant(uint16_to_float(img), exif.get("daylight_wb"))
+        for img, exif in zip(images, exif_list)
+    ]
 
     if s3["series_lock"]:
         lock = series_illuminant(illuminants)
@@ -36,7 +43,8 @@ def process_series(
     return corrected
 
 
-def process_single(img: np.ndarray, cfg: dict) -> tuple[np.ndarray, np.ndarray]:
-    """Single-image WB (useful in the pipeline without a full series)."""
-    illuminant = shades_of_gray(uint16_to_float(img))
+def process_single(img: np.ndarray, cfg: dict, exif: dict | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """Single-image WB. Pass exif dict with 'daylight_wb' for sensor-calibrated correction."""
+    daylight_wb = (exif or {}).get("daylight_wb")
+    illuminant = full_illuminant(uint16_to_float(img), daylight_wb)
     return apply_wb(img, illuminant), illuminant

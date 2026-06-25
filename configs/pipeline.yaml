@@ -1,6 +1,8 @@
 stage1_raw:
   demosaic_algorithm: AHD          # AHD | DHT | AAHD
   output_bps: 16
+  wb_mode: camera                  # camera = use_camera_wb=True (single-shot real estate)
+                                   # neutral = user_wb=[1,1,1,1] (HDR brackets — preserves relative EV)
   denoise_enabled: false           # OFF by default — Mertens averages noise
   denoise_model: nafnet            # nafnet only escalation path
   lens_correction:

@@ -17,7 +17,8 @@ def process(raw_path: Path, cfg: dict) -> tuple[np.ndarray, dict]:
     s1 = cfg["stage1_raw"]
     log.info("stage1.start", path=str(raw_path))
 
-    img, exif = decode_raw(raw_path)
+    wb_mode = s1.get("wb_mode", "camera")
+    img, exif = decode_raw(raw_path, wb_mode=wb_mode)
 
     lc = s1["lens_correction"]
     if lc["enabled"]:
