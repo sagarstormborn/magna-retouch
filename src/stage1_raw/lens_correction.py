@@ -73,7 +73,7 @@ def correct_lens(
 
     log.info("lens_correction.ok", body=exif.get("camera_body"), lens=str(lens))
 
-    result = np.clip(work * scale, 0, scale).astype(original_dtype)
+    result = np.clip(work.astype(np.float64) * scale, 0, scale).astype(original_dtype)
     return result
 
 

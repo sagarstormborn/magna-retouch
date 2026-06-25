@@ -1,17 +1,20 @@
 """
 Train the Image-Adaptive 3D LUT on Matt's RAW→retouched pairs.
 
-Usage:
-    python -m src.stage4_look.train --config configs/pipeline.yaml \
-        --train_dir data/train --val_dir data/val
+Input:  data/train/input/   — C1 TIFs (uint8, Matt's RAW conversion pre-retouch)
+Target: data/train/target/  — Matt's retouched JPGs (uint8, matched by stem)
 
-data/train layout expected:
-    data/train/input/   ← Stage 1-3 processed images (TIFF 16-bit)
-    data/train/target/  ← Matt's retouched output (TIFF 16-bit, matched filenames)
+Usage:
+    python -m src.stage4_look.train
+    python -m src.stage4_look.train --config configs/pipeline.yaml --epochs 400
 """
+from __future__ import annotations
+
 import argparse
+import random
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 import torch.nn as nn
@@ -20,58 +23,187 @@ from torch.utils.data import Dataset, DataLoader
 import structlog
 
 from src.common.config import load_config
-from src.common.io import load_tiff_16, uint16_to_float
+from src.common.logging import setup_logging
 from .lut3d import AdaptiveLUT3DModel
 
 log = structlog.get_logger(__name__)
 
 
+# ── Dataset ───────────────────────────────────────────────────────────────────
+
 class PairDataset(Dataset):
-    def __init__(self, input_dir: Path, target_dir: Path, size: int = 480):
-        self.inputs = sorted(input_dir.glob("*.tiff")) + sorted(input_dir.glob("*.tif"))
-        self.targets = sorted(target_dir.glob("*.tiff")) + sorted(target_dir.glob("*.tif"))
-        assert len(self.inputs) == len(self.targets), "Input/target count mismatch"
-        self.size = size
+    """
+    Matches input TIFs to target JPGs by stem prefix (DSCF####).
+    Both are uint8; loaded as RGB float32 in [0, 1].
+    Random crops + flips for augmentation (21 pairs → no overfitting room without it).
+    """
+    def __init__(self, input_dir: Path, target_dir: Path,
+                 crop_size: int = 480, augment: bool = True,
+                 brightness_norm: bool = True):
+        self.augment = augment
+        self.crop_size = crop_size
+        self.brightness_norm = brightness_norm
 
-    def __len__(self):
-        return len(self.inputs)
+        inp_files = (sorted(input_dir.glob("*.tif")) + sorted(input_dir.glob("*.tiff"))
+                     + sorted(input_dir.glob("*.jpg")) + sorted(input_dir.glob("*.jpeg")))
+        tgt_by_stem = {p.stem: p for p in
+                       list(target_dir.glob("*.jpg")) + list(target_dir.glob("*.jpeg"))}
 
-    def __getitem__(self, idx):
-        inp = _resize(uint16_to_float(load_tiff_16(self.inputs[idx])), self.size)
-        tgt = _resize(uint16_to_float(load_tiff_16(self.targets[idx])), self.size)
-        return (
-            torch.from_numpy(inp.transpose(2, 0, 1)),
-            torch.from_numpy(tgt.transpose(2, 0, 1)),
-        )
+        self.pairs: list[tuple[Path, Path]] = []
+        for inp in inp_files:
+            # input stem: "DSCF4652_MATTS..." or "DSCF4652" → key = DSCF4652
+            key = inp.stem.split("_")[0]
+            if key in tgt_by_stem:
+                self.pairs.append((inp, tgt_by_stem[key]))
+
+        if not self.pairs:
+            raise ValueError(f"No matched pairs found in {input_dir} / {target_dir}")
+
+        # Compute median target brightness for normalisation
+        # Decouples per-image exposure from colour grade so LUT only learns colour
+        if brightness_norm:
+            tgt_means = []
+            for _, tgt_p in self.pairs:
+                b = cv2.imread(str(tgt_p))
+                if b is not None:
+                    tgt_means.append(b.mean() / 255.0)
+            self.target_brightness = float(np.median(tgt_means)) if tgt_means else 0.625
+        else:
+            self.target_brightness = None
+
+        log.info("dataset.loaded", n_pairs=len(self.pairs), crop=crop_size,
+                 target_brightness=round(self.target_brightness or 0, 3) if brightness_norm else "off")
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        inp_path, tgt_path = self.pairs[idx]
+
+        inp = _load_rgb_f32(inp_path)
+        tgt = _load_rgb_f32(tgt_path)
+
+        # Brightness normalisation: scale input to match target median brightness.
+        # Prevents the LUT from learning per-image exposure instead of colour grade.
+        if self.target_brightness is not None:
+            inp_mean = inp.mean()
+            if inp_mean > 1e-4:
+                scale = self.target_brightness / inp_mean
+                inp = np.clip(inp * scale, 0, 1)
+
+        # Resize target to match input dimensions (C1 TIF > Matt JPG)
+        if inp.shape[:2] != tgt.shape[:2]:
+            tgt = cv2.resize(tgt, (inp.shape[1], inp.shape[0]),
+                             interpolation=cv2.INTER_AREA)
+
+        # Random crop
+        h, w = inp.shape[:2]
+        c = self.crop_size
+        if h > c and w > c:
+            y = random.randint(0, h - c)
+            x = random.randint(0, w - c)
+            inp = inp[y:y+c, x:x+c]
+            tgt = tgt[y:y+c, x:x+c]
+        else:
+            inp = cv2.resize(inp, (c, c), interpolation=cv2.INTER_AREA)
+            tgt = cv2.resize(tgt, (c, c), interpolation=cv2.INTER_AREA)
+
+        # Augmentation
+        if self.augment and random.random() > 0.5:
+            inp = inp[:, ::-1].copy()
+            tgt = tgt[:, ::-1].copy()
+
+        return _to_tensor(inp), _to_tensor(tgt)
 
 
-def _resize(img: np.ndarray, size: int) -> np.ndarray:
-    import cv2
-    h, w = img.shape[:2]
-    scale = size / min(h, w)
-    return cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+def _load_rgb_f32(path: Path) -> np.ndarray:
+    bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if bgr is None:
+        raise FileNotFoundError(path)
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    return rgb.astype(np.float32) / 255.0
 
 
-def train(cfg: dict, train_dir: Path, val_dir: Path):
-    s4 = cfg["stage4_look"]["train"]
+def _to_tensor(img: np.ndarray) -> torch.Tensor:
+    return torch.from_numpy(img.transpose(2, 0, 1))
+
+
+# ── Loss ──────────────────────────────────────────────────────────────────────
+
+class CombinedLoss(nn.Module):
+    """MSE + optional LPIPS perceptual loss (lpips import is deferred)."""
+    def __init__(self, lpips_weight: float = 0.0):
+        super().__init__()
+        self.mse = nn.MSELoss()
+        self.lpips_weight = lpips_weight
+        self._lpips = None
+
+    def _get_lpips(self):
+        if self._lpips is None:
+            try:
+                import lpips
+                self._lpips = lpips.LPIPS(net="alex")
+                log.info("loss.lpips_enabled")
+            except ImportError:
+                log.warning("loss.lpips_not_installed_falling_back_to_mse")
+                self.lpips_weight = 0.0
+        return self._lpips
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        loss = self.mse(pred, target)
+        if self.lpips_weight > 0:
+            net = self._get_lpips()
+            if net is not None:
+                # lpips expects [-1, 1]
+                p = pred  * 2 - 1
+                t = target * 2 - 1
+                loss = loss + self.lpips_weight * net(p, t).mean()
+        return loss
+
+
+# ── Training loop ──────────────────────────────────────────────────────────────
+
+def train(cfg: dict, epochs: int | None = None, resume: bool = True):
+    s4 = cfg["stage4_look"]
+    tr = s4["train"]
+    n_epochs   = epochs or tr["n_epochs"]
+    lr         = tr["lr"]
+    batch_size = tr["batch_size"]
+    crop_size  = tr.get("train_size", 480)
+    n_luts     = s4.get("n_luts", 3)
+    lut_size   = s4["lut_size"]
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    log.info("stage4.train_start", device=device, epochs=s4["n_epochs"])
+    log.info("train.start", device=device, epochs=n_epochs, lr=lr, n_luts=n_luts)
 
-    model = AdaptiveLUT3DModel(lut_size=cfg["stage4_look"]["lut_size"]).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=s4["lr"])
-    loss_fn = nn.MSELoss()
+    # Data
+    brightness_norm = tr.get("brightness_norm", True)
+    ds = PairDataset(Path("data/train/our_input"), Path("data/train/our_target"),
+                     crop_size=crop_size, augment=True, brightness_norm=brightness_norm)
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=True,
+                    num_workers=0, pin_memory=False)
 
-    train_ds = PairDataset(train_dir / "input", train_dir / "target", s4["train_size"])
-    train_dl = DataLoader(train_ds, batch_size=s4["batch_size"], shuffle=True, num_workers=2)
-
-    out_path = Path(cfg["stage4_look"]["lut_model_path"])
+    # Model
+    model = AdaptiveLUT3DModel(n_luts=n_luts, lut_size=lut_size).to(device)
+    out_path = Path(s4["lut_model_path"])
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    best_loss = float("inf")
 
-    for epoch in range(1, s4["n_epochs"] + 1):
+    start_epoch = 1
+    best_loss = float("inf")
+    if resume and out_path.exists():
+        model.load_state_dict(torch.load(out_path, map_location=device))
+        log.info("train.resumed", path=str(out_path))
+
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    # Cosine annealing: gradually reduce lr to 0 over training
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs, eta_min=lr * 0.01)
+    loss_fn = CombinedLoss(lpips_weight=tr.get("lpips_weight", 0.0))
+
+    for epoch in range(start_epoch, n_epochs + 1):
         model.train()
         epoch_loss = 0.0
-        for inp, tgt in train_dl:
+
+        for inp, tgt in dl:
             inp, tgt = inp.to(device), tgt.to(device)
             pred = model(inp)
             loss = loss_fn(pred, tgt)
@@ -80,23 +212,33 @@ def train(cfg: dict, train_dir: Path, val_dir: Path):
             optimizer.step()
             epoch_loss += loss.item()
 
-        epoch_loss /= len(train_dl)
+        epoch_loss /= len(dl)
+        scheduler.step()
+
         if epoch_loss < best_loss:
             best_loss = epoch_loss
             torch.save(model.state_dict(), out_path)
 
-        if epoch % 50 == 0:
-            log.info("stage4.train_epoch", epoch=epoch, loss=round(epoch_loss, 6))
+        if epoch % 25 == 0 or epoch <= 5:
+            log.info("train.epoch", epoch=epoch, loss=round(epoch_loss, 6),
+                     lr=round(scheduler.get_last_lr()[0], 7), best=round(best_loss, 6))
+            print(f"  [{epoch:4d}/{n_epochs}]  loss={epoch_loss:.6f}  best={best_loss:.6f}"
+                  f"  lr={scheduler.get_last_lr()[0]:.2e}")
 
-    log.info("stage4.train_done", best_loss=round(best_loss, 6), saved=str(out_path))
+    log.info("train.done", best_loss=round(best_loss, 6), saved=str(out_path))
+    print(f"\nTraining complete. Best loss: {best_loss:.6f}  →  {out_path}")
+    return best_loss
 
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/pipeline.yaml")
-    parser.add_argument("--train_dir", default="data/train")
-    parser.add_argument("--val_dir", default="data/val")
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--no-resume", action="store_true")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    train(cfg, Path(args.train_dir), Path(args.val_dir))
+    setup_logging(cfg["logging"]["level"], cfg["logging"]["log_dir"], "train")
+    train(cfg, epochs=args.epochs, resume=not args.no_resume)

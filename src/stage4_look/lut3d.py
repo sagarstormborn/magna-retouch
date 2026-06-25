@@ -1,99 +1,160 @@
 """
-Image-Adaptive 3D LUT — inference wrapper.
-Training uses HuiZeng/Image-Adaptive-3DLUT (Apache-2.0).
+Image-Adaptive 3D LUT — model definition and inference.
 
-The model learns basis LUTs + a small CNN that blends them per-image.
-We run inference only here; training is a separate CLI entry-point.
+Architecture (after HuiZeng/Image-Adaptive-3DLUT, Apache-2.0):
+  - n_luts basis LUTs (learnable 3-D colour lookup tables)
+  - Lightweight CNN classifier: predicts per-image blending weights
+  - Output = weighted sum of basis LUTs applied via trilinear interpolation
 
-If model weights are not found, raises FileNotFoundError with an install hint.
+Classifier uses GlobalAveragePool so it runs at any input resolution.
+Training uses random 480p crops; inference applies the LUT at full resolution.
 """
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import structlog
 
 log = structlog.get_logger(__name__)
 
 
-class TrilinearInterpolation(nn.Module):
-    """Pure-PyTorch trilinear LUT interpolation (fallback when CUDA op unavailable)."""
+# ── Trilinear LUT interpolation (pure PyTorch) ────────────────────────────────
 
+class TrilinearInterp(nn.Module):
+    """
+    Apply a 3D LUT to an image via trilinear interpolation using grid_sample.
+    lut  : (1, D, D, D, 3) — one LUT in grid_sample "flow" layout
+    img  : (B, 3, H, W)    — pixel values in [0, 1]
+    """
     def forward(self, lut: torch.Tensor, img: torch.Tensor) -> torch.Tensor:
-        # lut: (batch, 3, D, D, D)   img: (batch, 3, H, W) in [0,1]
         b, c, h, w = img.shape
-        d = lut.shape[2]
-
-        # Normalise img to grid_sample coordinates [-1, 1]
-        coords = img.permute(0, 2, 3, 1).unsqueeze(1)  # (B,1,H,W,3)
-        coords = coords * 2.0 - 1.0
-
-        out_channels = []
-        for i in range(3):
-            ch = nn.functional.grid_sample(
-                lut[:, i:i+1, :, :, :],
-                coords,
-                mode="bilinear",
-                padding_mode="border",
-                align_corners=True,
-            )
-            out_channels.append(ch.squeeze(1))
-        return torch.stack(out_channels, dim=1)
+        # grid_sample expects coords in [-1, 1]
+        # img pixels (R, G, B) → (x, y, z) grid coords
+        coords = img.permute(0, 2, 3, 1) * 2.0 - 1.0   # (B, H, W, 3)
+        coords = coords.unsqueeze(1)                      # (B, 1, H, W, 3)
+        # lut: (1, D, D, D, 3) → (1, 3, D, D, D) for grid_sample
+        lut_5d = lut.permute(0, 4, 1, 2, 3)
+        lut_5d = lut_5d.expand(b, -1, -1, -1, -1)
+        out = F.grid_sample(lut_5d, coords,
+                            mode="bilinear", padding_mode="border",
+                            align_corners=True)              # (B, 3, 1, H, W)
+        return out.squeeze(2)                                # (B, 3, H, W)
 
 
-class AdaptiveLUT3DModel(nn.Module):
+# ── Lightweight classifier CNN ────────────────────────────────────────────────
+
+class LUTClassifier(nn.Module):
     """
-    Minimal re-implementation of the inference path of Image-Adaptive-3DLUT.
-    Compatible with weights trained from the original repo.
+    Predicts per-image blending weights over n_luts basis LUTs.
+    Works at any input resolution via GlobalAveragePool.
+    ~35 K parameters.
     """
-
-    def __init__(self, n_luts: int = 3, lut_size: int = 33):
+    def __init__(self, n_luts: int = 3):
         super().__init__()
-        self.lut_size = lut_size
-
-        # Basis LUTs (learnable)
-        d = lut_size
-        self.luts = nn.Parameter(torch.zeros(n_luts, 3, d, d, d))
-        nn.init.normal_(self.luts, std=0.01)
-
-        # Tiny CNN: produces per-image weights over the n_luts basis LUTs
-        self.classifier = nn.Sequential(
-            nn.AdaptiveAvgPool2d((256, 256)),
+        self.net = nn.Sequential(
+            nn.Conv2d(3, 16, 3, stride=2, padding=1), nn.ReLU(),
+            nn.Conv2d(16, 32, 3, stride=2, padding=1), nn.ReLU(),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.ReLU(),
+            nn.Conv2d(64, 64, 3, stride=2, padding=1), nn.ReLU(),
+            nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
-            nn.Linear(3 * 256 * 256, 64),
-            nn.ReLU(),
             nn.Linear(64, n_luts),
             nn.Softmax(dim=1),
         )
 
-        self.interp = TrilinearInterpolation()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+# ── Full model ────────────────────────────────────────────────────────────────
+
+class AdaptiveLUT3DModel(nn.Module):
+    def __init__(self, n_luts: int = 3, lut_size: int = 33):
+        super().__init__()
+        d = lut_size
+        self.lut_size = lut_size
+        self.n_luts = n_luts
+
+        # Basis LUTs — identity-initialised so untrained model = passthrough
+        self.luts = nn.Parameter(self._identity_lut(n_luts, d))
+        self.classifier = LUTClassifier(n_luts)
+        self.interp = TrilinearInterp()
+
+    @staticmethod
+    def _identity_lut(n: int, d: int) -> torch.Tensor:
+        """
+        Initialise basis LUTs with diversity so the classifier has a meaningful
+        gradient from step 1. All-identical identity init causes classifier collapse
+        (weights like [0,0,1]) and the model degenerates to a single LUT.
+
+        Basis LUT roles:
+          0 — neutral identity (passthrough)
+          1 — brightness boost (~+0.3 stop, for underexposed rooms)
+          2 — warm grade (slight R+, B−, to approximate Matt's neutral-warm target)
+          3+ — small random perturbations for remaining slots
+        """
+        lin = torch.linspace(0, 1, d)
+        r, g, b = torch.meshgrid(lin, lin, lin, indexing="ij")
+        identity = torch.stack([r, g, b], dim=-1)      # (D, D, D, 3)
+
+        luts = []
+        for i in range(n):
+            if i == 0:
+                lut = identity.clone()
+            elif i == 1:
+                # Brightness boost: gamma < 1 brightens (x^0.75)
+                lut = identity.clone().pow(0.75)
+            elif i == 2:
+                # Warm colour grade: lift R, suppress B slightly
+                lut = identity.clone()
+                lut[..., 0] = (identity[..., 0] * 1.05).clamp(0, 1)  # R +5%
+                lut[..., 2] = (identity[..., 2] * 0.95).clamp(0, 1)  # B −5%
+            else:
+                # Random perturbation for additional slots
+                lut = identity.clone() + torch.randn_like(identity) * 0.02
+            luts.append(lut)
+
+        return torch.stack(luts, dim=0)   # (n, D, D, D, 3)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        weights = self.classifier(x)                        # (B, n_luts)
-        lut = (weights[:, :, None, None, None, None] * self.luts.unsqueeze(0)).sum(dim=1)
-        return self.interp(lut, x)
+        weights = self.classifier(x)                     # (B, n_luts)
+        # Blend basis LUTs: (B, 1, 1, 1, 1) × (n, D, D, D, 3) summed over n
+        lut = (weights[:, :, None, None, None, None] *
+               self.luts.unsqueeze(0)).sum(dim=1)        # (B, D, D, D, 3)
+        lut = lut.unsqueeze(0) if lut.dim() == 4 else lut
+        # Apply per-image
+        out = []
+        for i in range(x.shape[0]):
+            out.append(self.interp(lut[i:i+1], x[i:i+1]))
+        return torch.cat(out, dim=0)
 
+
+# ── Load / apply ──────────────────────────────────────────────────────────────
 
 def load_model(cfg: dict, device: str = "cpu") -> AdaptiveLUT3DModel:
     model_path = Path(cfg["stage4_look"]["lut_model_path"])
     if not model_path.exists():
         raise FileNotFoundError(
-            f"LUT model not found at {model_path}. "
-            "Train first: python -m src.stage4_look.train --config configs/pipeline.yaml"
+            f"LUT model not found at {model_path}.\n"
+            "Train first:  make train"
         )
-    model = AdaptiveLUT3DModel(lut_size=cfg["stage4_look"]["lut_size"])
+    model = AdaptiveLUT3DModel(
+        n_luts=cfg["stage4_look"].get("n_luts", 3),
+        lut_size=cfg["stage4_look"]["lut_size"],
+    )
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval().to(device)
-    log.info("stage4.model_loaded", path=str(model_path), device=device)
+    log.info("stage4.model_loaded", path=str(model_path))
     return model
 
 
-def apply_lut(img_uint16: np.ndarray, model: AdaptiveLUT3DModel, device: str = "cpu") -> np.ndarray:
-    """Run LUT inference on a uint16 HxWx3 image. Returns uint16."""
-    f32 = img_uint16.astype(np.float32) / 65535.0
-    t = torch.from_numpy(f32.transpose(2, 0, 1)).unsqueeze(0).to(device)  # (1,3,H,W)
+def apply_lut(img_uint8: np.ndarray, model: AdaptiveLUT3DModel, device: str = "cpu") -> np.ndarray:
+    """Run LUT inference on a uint8 HxWx3 RGB image. Returns uint8."""
+    f32 = img_uint8.astype(np.float32) / 255.0
+    t = torch.from_numpy(f32.transpose(2, 0, 1)).unsqueeze(0).to(device)
     with torch.no_grad():
         out = model(t)
-    out_np = out.squeeze(0).cpu().numpy().transpose(1, 2, 0)  # HxWx3
-    return (np.clip(out_np, 0, 1) * 65535 + 0.5).astype(np.uint16)
+    out_np = out.squeeze(0).cpu().numpy().transpose(1, 2, 0)
+    return (np.clip(out_np, 0, 1) * 255 + 0.5).astype(np.uint8)

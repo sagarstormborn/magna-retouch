@@ -28,13 +28,17 @@ stage3_wb:
 stage4_look:
   method: lut3d                    # lut3d | hdrnet
   lut_size: 33
+  n_luts: 3
   lut_model_path: models/lut3d/model_best.pth
   hdrnet_model_path: models/hdrnet/model_best.pth
   train:
     n_epochs: 400
-    lr: 0.0001
-    batch_size: 1
+    lr: 0.0002                     # slightly higher — diverse init needs faster LUT updates
+    batch_size: 4
     train_size: 480
+    lpips_weight: 0.0              # set to 0.1 after pip install lpips
+    brightness_norm: true          # normalise input brightness to training median before S4
+    target_brightness: 0.609       # Matt's median output brightness (measured from 21 pairs)
 
 stage5_benchmark:
   delta_e_threshold: 2.0           # ΔE2000 target ≲ 2 (Matt criterion 3)
