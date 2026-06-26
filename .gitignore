@@ -16,3 +16,5 @@ trilinear_cpp/build/
 
 # SAM checkpoint (358 MB — download via zone_seg._download())
 models/sam/*.pth
+models/sam/*.pth
+data/train/zone_maps/*.npy
