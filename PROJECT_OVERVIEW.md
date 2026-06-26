@@ -267,15 +267,25 @@ All found by running on real data — not theoretical.
 
 ## 8. What's Currently Running
 
-| Machine | Process | Status | Expected done |
-|---|---|---|---|
-| **Server RTX 3060** | LUTwithBGrid training, 98 pairs, 640px crops | ⏳ epoch ~10/400 | ~3 hours |
-| **Mac CPU** | SepLUT training, 71 pairs | ⏳ epoch ~100/400 | ~5 hours |
+| GPU | Architecture | Pairs | Batch | Crop | Epochs | Speed | ETA |
+|---|---|---|---|---|---|---|---|
+| **RTX 3060** | LUTwithBGrid | 98 | 16 | 800 | 800 | ~6s/ep | ~80 min |
+| **GTX 1660 SUPER** | SepLUT | 98 | 8 | 640 | 800 | ~6s/ep | ~80 min |
 
-Both train independently. When server finishes:
-1. `scp sagar@49.206.252.63:~/Desktop/magna-retouch/models/lut3d/model_best.pth models/lut3d/model_bgrid.pth`
-2. Run inference + metrics on test set
-3. Push to GitHub
+**GPU utilisation:** RTX 3060 @ 72% (103W) · GTX 1660 @ 21% (42W)
+
+**Key optimisations applied:**
+- In-memory dataset: all 98 pairs preloaded into RAM → zero disk IO per batch
+- LPIPS resized to 256px before perceptual loss (was 800px → 13× speedup)
+- 2 dataloader workers share preloaded numpy arrays (no copy) via fork
+- Gradient clipping at max_norm=1.0
+- `python -u` (unbuffered) → every epoch logged
+
+When done (monitor with `tmux attach -t gpu0` or `gpu1`):
+1. `scp sagar@49.206.252.63:~/Desktop/magna-retouch/models/lut3d/bgrid_best.pth models/lut3d/`
+2. `scp sagar@49.206.252.63:~/Desktop/magna-retouch/models/lut3d/seplut_best.pth models/lut3d/`
+3. Run full 21-image series inference + metrics comparison
+4. Push best model to GitHub
 
 ---
 

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import numpy as np
@@ -8,6 +9,24 @@ from .lut3d import load_model, apply_lut   # load_model uses build_model interna
 log = structlog.get_logger(__name__)
 
 _model_cache: dict = {}
+
+
+def _pinned_target_brightness(cfg: dict) -> float:
+    """
+    Read the brightness-norm value pinned at training time (norm.json sidecar
+    next to the model). Falls back to the config value if the sidecar is absent.
+    This guarantees train and inference normalise to the exact same brightness.
+    """
+    model_path = Path(cfg["stage4_look"]["lut_model_path"])
+    sidecar = model_path.parent / "norm.json"
+    if sidecar.exists():
+        try:
+            tb = json.loads(sidecar.read_text()).get("target_brightness")
+            if tb:
+                return float(tb)
+        except (ValueError, OSError):
+            pass
+    return cfg["stage4_look"]["train"].get("target_brightness", 0.609)
 
 
 def process(img: np.ndarray, cfg: dict) -> np.ndarray:
@@ -34,7 +53,7 @@ def process(img: np.ndarray, cfg: dict) -> np.ndarray:
 
     if s4["train"].get("brightness_norm", False):
         import math
-        target_brightness = s4["train"].get("target_brightness", 0.609)
+        target_brightness = _pinned_target_brightness(cfg)
         inp_f32 = img.astype(np.float32) / 255.0
         inp_mean = inp_f32.mean()
         if inp_mean > 1e-4 and inp_mean < 0.999:
