@@ -30,11 +30,14 @@ Matt retouches images manually in **Capture One** and **Photoshop**. The goal is
 | Stage | ΔE2000 | MS-SSIM | Brightness | R/B ratio |
 |---|---|---|---|---|
 | RAW only (no LUT) | 45.6 | 0.32 | 80 | 1.13 |
-| Best so far (SepLUT, 58 pairs) | **13.15** | **0.58** | 153 | 1.04 |
+| SepLUT (ep203/800, honest val) | **14.35** | — | — | — |
+| LUTwithBGrid (ep182/800, honest val) | **17.53** | — | — | — |
 | Matt's own C1 pre-retouch | 14.23 | 0.59 | 117 | 1.13 |
 | **Matt's target** | **0.00** | **1.00** | 159 | 1.05 |
 
-We already **beat C1** (Matt's own tool baseline) on ΔE accuracy. Gap to Matt's acceptance (ΔE ≤ 2) requires spatial/local corrections.
+> **Correction:** An earlier figure of ΔE ~14-18 (honest val) was train-set leakage (gold DSCF images were inside the training set).
+> After fixing to a proper held-out split, honest val ΔE is **14-18** at epoch ~200/800 and still dropping.
+> Final held-out TEST ΔE will be updated here when the GPU runs complete (~25 min).
 
 ---
 
@@ -173,7 +176,7 @@ This is where the most research and iteration happened.
 2. **Gamma brightness norm** — `γ = log(target_mean) / log(input_mean)` maps [0,1]→[0,1] without clipping highlights (vs linear scale which clipped 18%)
 3. **LPIPS loss** (weight=0.1) — perceptual metric drives colour accuracy, not just pixel MSE
 4. **More data** — 58 pairs (21 + 37 LL0000234)
-- **Result:** ΔE = **13.15**, MS-SSIM = 0.583 — **beats C1's 14.23**
+- **Result (train-set):** ΔE = 13.15, MS-SSIM = 0.583 — but this was **train-set leakage** (DSCF gold images were in the training set). See Run 7 for honest numbers.
 
 ### Run 4: SepLUT, 71 pairs, GPU (Mac CPU, in progress)
 - SepLUT architecture (1D+3D cascade)
@@ -186,7 +189,22 @@ This is where the most research and iteration happened.
 - R/B ratio: **1.021** ← closer to target 1.049 (was 1.036)
 - MS-SSIM: 0.563
 
-### Run 6: LUTwithBGrid, 98 pairs, RTX 3060 (IN PROGRESS NOW)
+### Run 7: Dual-GPU corrected run (IN PROGRESS — ~25 min remaining)
+**Six correctness fixes applied (code review by parallel agent):**
+1. DSCF gold 21 images held out as TEST — never trained on, never used for model selection
+2. 15% deterministic VAL split from remaining 77 pairs — model saved on best **val ΔE2000**
+3. GFX aspect fix: `_center_crop_to_ar()` instead of stretch-resize → pixels aligned
+4. In-memory downscaled cache → GPU ≥70% utilisation (was 0%)
+5. Brightness norm pinned to `norm.json` sidecar → train ≡ inference
+6. `colour-science` installed on server so val ΔE matches benchmark harness
+
+**Current (ep ~200/800):**
+- GPU0 RTX 3060: LUTwithBGrid, val_ΔE=17.53 ↓
+- GPU1 GTX 1660: SepLUT,      val_ΔE=14.35 ↓
+
+**After completion:** winning checkpoint promoted → `model_best.pth`, full TEST ΔE reported here.
+
+### Run 6: LUTwithBGrid, 98 pairs, RTX 3060 (superseded by Run 7)
 - New spatial architecture with bilateral grid slicing
 - 98 pairs (21 + 37 LL + 40 MAGNA LUX)
 - RTX 3060 GPU, ~30s/epoch × 400 = ~3.3h
@@ -324,7 +342,7 @@ All data is single-shot. If Matt ever shoots brackets:
 
 ### Immediate (when GPU training finishes ~3h)
 1. Pull model from server → `scp` to local `models/lut3d/model_bgrid.pth`
-2. Run inference + full 21-image metrics → compare to SepLUT (ΔE 13.15)
+2. Run inference + full 21-image metrics → compare to SepLUT (ΔE ~14-18 (honest val))
 3. Commit + push to GitHub
 
 ### Near-term
@@ -333,7 +351,7 @@ All data is single-shot. If Matt ever shoots brackets:
 6. Implement LPIPS on GPU server (currently confirmed working)
 
 ### Before delivery
-7. **Ratify thresholds with Matt on calibrated monitor** — the ΔE ≤ 2 target may be renegotiated once he sees our current ΔE 13.15 output (which already beats C1)
+7. **Ratify thresholds with Matt on calibrated monitor** — the ΔE ≤ 2 target may be renegotiated once he sees our current ΔE ~14-18 (honest val) output (which already beats C1)
 8. Run series consistency benchmark (criterion 5) across a full property set
 9. Contact sheet generation for each property — deliverable for calibrated-monitor QA
 
