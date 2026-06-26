@@ -141,6 +141,13 @@ def _resize_long(img: np.ndarray, long_side: int) -> np.ndarray:
 
 # ── In-memory dataset (downscaled → light per-step crop) ──────────────────────────
 
+ZONE_MAP_DIR = Path("data/train/zone_maps")
+
+# Per-zone loss weights: windows matter most (blown = lost detail),
+# sky/ceiling next (dominant colour grade surface), floor/walls baseline.
+ZONE_LOSS_WEIGHTS = {0: 1.3, 1: 1.2, 2: 2.0, 3: 1.0}   # sky/ceil, floor, windows, walls
+
+
 class CachedPairDataset(Dataset):
     """
     Preloads aspect-matched, brightness-normalised pairs into RAM as uint8,
@@ -161,17 +168,16 @@ class CachedPairDataset(Dataset):
         self.target_brightness = target_brightness
         work_short = round(crop_size * 1.5)
 
-        # metadata[stem] = {hour, month, ...} — loaded from data/train/metadata.json
         self.metadata = metadata or {}
 
         self.data: list[tuple[np.ndarray, np.ndarray]] = []
-        self.meta_tensors: list[tuple[float, float]] = []  # (hour, month) per pair
+        self.meta_tensors: list[tuple[float, float]] = []
+        self.zone_maps: list[np.ndarray | None] = []   # HxW uint8 zone IDs (or None)
 
         for inp_p, tgt_p in pairs:
             inp = _load_rgb_u8(inp_p)
             tgt = _load_rgb_u8(tgt_p)
 
-            # Align geometry: crop input to target's aspect, then match dimensions.
             inp = _center_crop_to_ar(inp, tgt.shape[1] / tgt.shape[0])
             if mode == "train":
                 inp, tgt = _resize_short(inp, work_short), _resize_short(tgt, work_short)
@@ -181,7 +187,6 @@ class CachedPairDataset(Dataset):
                 tgt = cv2.resize(tgt, (inp.shape[1], inp.shape[0]),
                                  interpolation=cv2.INTER_AREA)
 
-            # Per-image brightness normalisation
             if brightness_norm:
                 tgt_brightness = tgt.astype(np.float32).mean() / 255.0
                 f = _gamma_to_brightness(inp.astype(np.float32) / 255.0, tgt_brightness)
@@ -189,16 +194,19 @@ class CachedPairDataset(Dataset):
 
             self.data.append((np.ascontiguousarray(inp), np.ascontiguousarray(tgt)))
 
-            # Load datetime metadata (hour, month) — default to noon/June if absent
             stem = inp_p.stem.split("_")[0]
             m = self.metadata.get(stem, {})
             self.meta_tensors.append((float(m.get("hour", 12.0)),
                                       float(m.get("month", 6.0))))
 
+            # Load pre-computed zone map, resize to match cached input shape
+            zone_map = _load_zone_map(stem, inp.shape[:2])
+            self.zone_maps.append(zone_map)
+
+        n_zones = sum(1 for z in self.zone_maps if z is not None)
         log.info("dataset.cached", mode=mode, n_pairs=len(self.data), crop=crop_size,
-                 brightness_norm=brightness_norm)
-        print(f"  cached {mode}: {len(self.data)} pairs"
-              f"{', per-image brightness norm' if brightness_norm else ''}",
+                 brightness_norm=brightness_norm, zone_maps=n_zones)
+        print(f"  cached {mode}: {len(self.data)} pairs  zone_maps={n_zones}/{len(self.data)}",
               flush=True)
 
     def __len__(self) -> int:
@@ -207,6 +215,8 @@ class CachedPairDataset(Dataset):
     def __getitem__(self, idx: int):
         inp, tgt = self.data[idx]
         hour, month = self.meta_tensors[idx]
+        zone_map = self.zone_maps[idx]   # HxW uint8 or None
+
         if self.mode == "train":
             h, w = inp.shape[:2]
             c = self.crop_size
@@ -215,14 +225,39 @@ class CachedPairDataset(Dataset):
                 x = random.randint(0, w - c)
                 inp = inp[y:y + c, x:x + c]
                 tgt = tgt[y:y + c, x:x + c]
+                if zone_map is not None:
+                    zone_map = zone_map[y:y + c, x:x + c]
             else:
                 inp = cv2.resize(inp, (c, c), interpolation=cv2.INTER_AREA)
                 tgt = cv2.resize(tgt, (c, c), interpolation=cv2.INTER_AREA)
+                if zone_map is not None:
+                    zone_map = cv2.resize(zone_map, (c, c), interpolation=cv2.INTER_NEAREST)
             if random.random() > 0.5:
                 inp = inp[:, ::-1]; tgt = tgt[:, ::-1]
+                if zone_map is not None: zone_map = zone_map[:, ::-1]
             if random.random() > 0.75:
                 inp = inp[::-1]; tgt = tgt[::-1]
-        return _to_tensor(inp), _to_tensor(tgt), torch.tensor(hour), torch.tensor(month)
+                if zone_map is not None: zone_map = zone_map[::-1]
+
+        # Zone map → int64 tensor (uniform -1 means "no zone map, use equal weights")
+        if zone_map is not None:
+            zone_t = torch.from_numpy(np.ascontiguousarray(zone_map).astype(np.int64))
+        else:
+            zone_t = torch.full(inp.shape[:2], -1, dtype=torch.int64)
+
+        return _to_tensor(inp), _to_tensor(tgt), torch.tensor(hour), torch.tensor(month), zone_t
+
+
+def _load_zone_map(stem: str, target_hw: tuple[int, int]) -> np.ndarray | None:
+    """Load pre-computed zone map and resize to target_hw (H, W)."""
+    path = ZONE_MAP_DIR / f"{stem}.npy"
+    if not path.exists():
+        return None
+    zm = np.load(str(path))   # HxW uint8
+    H, W = target_hw
+    if zm.shape != (H, W):
+        zm = cv2.resize(zm, (W, H), interpolation=cv2.INTER_NEAREST)
+    return zm.astype(np.uint8)
 
 
 def _to_tensor(img_u8: np.ndarray) -> torch.Tensor:
@@ -257,8 +292,12 @@ class CombinedLoss(nn.Module):
             self._lpips_device = device
         return self._lpips
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        loss = self.mse(pred, target)
+    def forward(self, pred: torch.Tensor, target: torch.Tensor,
+                zone_weights: torch.Tensor | None = None) -> torch.Tensor:
+        if zone_weights is not None:
+            loss = (zone_weights * (pred - target).pow(2)).mean()
+        else:
+            loss = self.mse(pred, target)
         if self.lpips_weight > 0:
             net = self._get_lpips(pred.device)
             if net is not None:
@@ -295,14 +334,47 @@ def evaluate_delta_e(model: nn.Module, dataset: CachedPairDataset, device: str) 
         ).unsqueeze(0).to(device)
         hour_t  = torch.tensor([dataset.meta_tensors[idx][0]]).to(device)
         month_t = torch.tensor([dataset.meta_tensors[idx][1]]).to(device)
+        # Zone fracs for eval: compute from stored zone map if available
+        zone_map_np = dataset.zone_maps[idx]
+        zone_fracs_t = None
+        if zone_map_np is not None and hasattr(model, "zone_aware") and model.zone_aware:
+            zm_t = torch.from_numpy(zone_map_np.astype(np.int64)).unsqueeze(0).to(device)
+            zone_fracs_t = _zone_fracs(zm_t, device)
         try:
-            out = model(t, hour=hour_t, month=month_t).squeeze(0).cpu().numpy().transpose(1, 2, 0)
+            out = model(t, hour=hour_t, month=month_t,
+                        zone_fracs=zone_fracs_t).squeeze(0).cpu().numpy().transpose(1, 2, 0)
         except TypeError:
             out = model(t).squeeze(0).cpu().numpy().transpose(1, 2, 0)
         pred_u8 = (np.clip(out, 0, 1) * 255 + 0.5).astype(np.uint8)
         des.append(delta_e2000(pred_u8.astype(np.uint16) * 257,
                                tgt_u8.astype(np.uint16) * 257))
     return float(np.mean(des)) if des else float("inf")
+
+
+def _zone_fracs(zone_map: torch.Tensor, device: str) -> torch.Tensor:
+    """Compute (B, 4) zone fraction tensor from (B, H, W) int64 zone ID map."""
+    B, H, W = zone_map.shape
+    N = float(H * W)
+    fracs = torch.zeros(B, 4, device=device)
+    valid = zone_map >= 0   # -1 means no zone map
+    for zid in range(4):
+        fracs[:, zid] = ((zone_map == zid) & valid).float().sum(dim=(1, 2)) / N
+    # If no zone map: uniform 0.25
+    no_map = ~valid.any(dim=(1, 2))
+    fracs[no_map] = 0.25
+    return fracs
+
+
+def _zone_weight_map(zone_map: torch.Tensor, device: str) -> torch.Tensor:
+    """Build (B, 1, H, W) spatial loss weight map from zone IDs."""
+    weights = torch.ones_like(zone_map, dtype=torch.float32)
+    for zid, w in ZONE_LOSS_WEIGHTS.items():
+        weights[zone_map == zid] = w
+    # Normalise per-image so mean weight = 1 (keeps total loss scale stable)
+    B = zone_map.shape[0]
+    mean_w = weights.reshape(B, -1).mean(dim=1).view(B, 1, 1)
+    weights = weights / mean_w.clamp(min=1e-6)
+    return weights.unsqueeze(1)   # (B, 1, H, W)
 
 
 # ── Training loop ──────────────────────────────────────────────────────────────
@@ -379,23 +451,31 @@ def train(cfg: dict, epochs: int | None = None, resume: bool = True,
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs, eta_min=lr * 0.01)
     loss_fn = CombinedLoss(lpips_weight=tr.get("lpips_weight", 0.0),
                            de_weight=tr.get("de_weight", 0.0))
-    lam_mono = tr.get("lambda_monotonicity", 0.0)
-    lam_tv   = tr.get("lambda_tv", 0.0)
+    lam_mono   = tr.get("lambda_monotonicity", 0.0)
+    lam_tv     = tr.get("lambda_tv", 0.0)
+    zone_aware = s4.get("zone_aware", False)
 
     best_val_de = float("inf")
     for epoch in range(1, n_epochs + 1):
         model.train()
         epoch_loss = 0.0
         for batch in dl:
-            inp, tgt, hour, month = batch
+            inp, tgt, hour, month, zone_map = batch
             inp, tgt = inp.to(device), tgt.to(device)
             hour, month = hour.to(device), month.to(device)
-            # Pass metadata to models that support it (SepLUTModel); others ignore kwargs
+            zone_map = zone_map.to(device)   # (B, H, W) int64, -1 = no map
+
+            # Compute zone fractions (B, 4) for metadata conditioning
+            zone_fracs = _zone_fracs(zone_map, device) if zone_aware else None
+
+            # Spatial zone-weight map for loss (B, 1, H, W)
+            zone_weights = _zone_weight_map(zone_map, device)
+
             try:
-                pred = model(inp, hour=hour, month=month)
+                pred = model(inp, hour=hour, month=month, zone_fracs=zone_fracs)
             except TypeError:
                 pred = model(inp)
-            loss = loss_fn(pred, tgt)
+            loss = loss_fn(pred, tgt, zone_weights=zone_weights)
             if lam_mono > 0 and hasattr(model, "luts_3d"):
                 loss = loss + lam_mono * monotonicity_loss(model.luts_3d)
             if lam_tv > 0 and hasattr(model, "luts_3d"):
@@ -463,8 +543,10 @@ if __name__ == "__main__":
     parser.add_argument("--crop",      type=int, default=None, help="Override crop size")
     parser.add_argument("--lr",        type=float, default=None, help="Override learning rate")
     parser.add_argument("--lpips",     type=float, default=None, help="Override LPIPS weight")
-    parser.add_argument("--mono",      type=float, default=None, help="Override lambda_monotonicity (0 = disable)")
-    parser.add_argument("--tv",        type=float, default=None, help="Override lambda_tv (0 = disable)")
+    parser.add_argument("--mono",       type=float, default=None, help="Override lambda_monotonicity (0 = disable)")
+    parser.add_argument("--tv",         type=float, default=None, help="Override lambda_tv (0 = disable)")
+    parser.add_argument("--zone-aware", action="store_true",
+                        help="Enable zone-conditioned training (9-dim metadata, zone-weighted loss)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -476,6 +558,7 @@ if __name__ == "__main__":
     if args.lpips:             cfg["stage4_look"]["train"]["lpips_weight"]        = args.lpips
     if args.mono is not None:  cfg["stage4_look"]["train"]["lambda_monotonicity"] = args.mono
     if args.tv   is not None:  cfg["stage4_look"]["train"]["lambda_tv"]           = args.tv
+    if args.zone_aware:        cfg["stage4_look"]["zone_aware"]                   = True
 
     train(cfg, epochs=args.epochs, resume=not args.no_resume,
           arch_override=args.arch, out_override=args.out)
