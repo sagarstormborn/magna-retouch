@@ -30,6 +30,7 @@ import cv2
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import structlog
@@ -152,11 +153,11 @@ class CachedPairDataset(Dataset):
     EVAL_LONG = 768
 
     def __init__(self, pairs, target_brightness, crop_size: int = 640,
-                 mode: str = "train"):
+                 mode: str = "train", brightness_norm: bool = True):
         self.pairs = pairs
         self.mode = mode
         self.crop_size = crop_size
-        self.target_brightness = target_brightness   # None → no brightness norm
+        self.target_brightness = target_brightness   # None → per-image norm
         work_short = round(crop_size * 1.5)
 
         self.data: list[tuple[np.ndarray, np.ndarray]] = []
@@ -174,18 +175,20 @@ class CachedPairDataset(Dataset):
                 tgt = cv2.resize(tgt, (inp.shape[1], inp.shape[0]),
                                  interpolation=cv2.INTER_AREA)
 
-            # Brightness-normalise the INPUT (target stays as Matt graded it).
-            if target_brightness is not None:
-                f = _gamma_to_brightness(inp.astype(np.float32) / 255.0, target_brightness)
+            # Brightness-normalise the INPUT to match its OWN target's brightness.
+            # Per-image: each input is gamma-shifted to its paired target's mean,
+            # eliminating the L* residual that a single global constant left behind.
+            if brightness_norm:
+                tgt_brightness = tgt.astype(np.float32).mean() / 255.0
+                f = _gamma_to_brightness(inp.astype(np.float32) / 255.0, tgt_brightness)
                 inp = (np.clip(f, 0, 1) * 255 + 0.5).astype(np.uint8)
 
             self.data.append((np.ascontiguousarray(inp), np.ascontiguousarray(tgt)))
 
         log.info("dataset.cached", mode=mode, n_pairs=len(self.data), crop=crop_size,
-                 target_brightness=(round(target_brightness, 4)
-                                    if target_brightness else None))
+                 brightness_norm=brightness_norm)
         print(f"  cached {mode}: {len(self.data)} pairs"
-              f"{'' if target_brightness is None else f', target_brightness={target_brightness:.3f}'}",
+              f"{', per-image brightness norm' if brightness_norm else ''}",
               flush=True)
 
     def __len__(self) -> int:
@@ -219,11 +222,12 @@ def _to_tensor(img_u8: np.ndarray) -> torch.Tensor:
 # ── Loss ──────────────────────────────────────────────────────────────────────
 
 class CombinedLoss(nn.Module):
-    """MSE + LPIPS. LPIPS net is moved to the training device on first call."""
-    def __init__(self, lpips_weight: float = 0.0):
+    """MSE + LPIPS + L* ΔE proxy. LPIPS net is moved to the training device on first call."""
+    def __init__(self, lpips_weight: float = 0.0, de_weight: float = 0.0):
         super().__init__()
         self.mse = nn.MSELoss()
         self.lpips_weight = lpips_weight
+        self.de_weight = de_weight
         self._lpips = None
         self._lpips_device = None
 
@@ -248,6 +252,20 @@ class CombinedLoss(nn.Module):
             net = self._get_lpips(pred.device)
             if net is not None:
                 loss = loss + self.lpips_weight * net(pred * 2 - 1, target * 2 - 1).mean()
+        if self.de_weight > 0:
+            # downsample to 64px (fast, geometry-invariant)
+            p64 = F.interpolate(pred,   64, mode='bilinear', antialias=True)
+            t64 = F.interpolate(target, 64, mode='bilinear', antialias=True)
+            # sRGB → linearise approx (fast, avoids colour-science import on GPU)
+            p_lin = p64.pow(2.2)
+            t_lin = t64.pow(2.2)
+            # L* = 116*(Y/Yn)^(1/3) - 16 approximation using Y channel
+            # Y ≈ 0.2126R + 0.7152G + 0.0722B
+            coeff = torch.tensor([0.2126, 0.7152, 0.0722],
+                                 device=pred.device).view(1, 3, 1, 1)
+            p_L = 116 * (p_lin * coeff).sum(1, keepdim=True).clamp(1e-8).pow(1/3) - 16
+            t_L = 116 * (t_lin * coeff).sum(1, keepdim=True).clamp(1e-8).pow(1/3) - 16
+            loss = loss + self.de_weight * F.mse_loss(p_L, t_L)
         return loss
 
 
@@ -302,25 +320,25 @@ def train(cfg: dict, epochs: int | None = None, resume: bool = True,
     print(f"  split → train={len(train_pairs)}  val={len(val_pairs)}  "
           f"test(held-out)={len(test_pairs)}", flush=True)
 
-    # ── Pinned brightness norm — computed on TRAIN targets only, then saved ───────
+    # ── Pinned brightness norm — per-image, saved as null in sidecar ─────────────
+    # Each input is normalised to its OWN target's brightness in the dataset loop,
+    # so a single global constant is no longer needed or stored.
     brightness_norm = tr.get("brightness_norm", True)
-    target_brightness = None
-    if brightness_norm:
-        means = [cv2.imread(str(t)).mean() / 255.0 for _, t in train_pairs
-                 if cv2.imread(str(t)) is not None]
-        target_brightness = float(np.median(means)) if means else 0.6
+    target_brightness = None   # null in sidecar; inference uses its own 0.58 approx
 
     out_path = Path(out_override or s4["lut_model_path"])
     out_path.parent.mkdir(parents=True, exist_ok=True)
     (out_path.parent / NORM_SIDECAR).write_text(json.dumps({
-        "target_brightness": target_brightness,
+        "target_brightness": target_brightness,  # null: per-image norm at train time
         "brightness_norm": brightness_norm,
         "architecture": arch,
         "model": out_path.name,
     }, indent=2))
 
-    train_ds = CachedPairDataset(train_pairs, target_brightness, crop_size, mode="train")
-    val_ds   = CachedPairDataset(val_pairs,   target_brightness, crop_size, mode="eval")
+    train_ds = CachedPairDataset(train_pairs, target_brightness, crop_size, mode="train",
+                                 brightness_norm=brightness_norm)
+    val_ds   = CachedPairDataset(val_pairs,   target_brightness, crop_size, mode="eval",
+                                 brightness_norm=brightness_norm)
 
     dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                     num_workers=0, pin_memory=(device == "cuda"))
@@ -336,7 +354,8 @@ def train(cfg: dict, epochs: int | None = None, resume: bool = True,
 
     optimizer = optim.Adam(model.parameters(), lr=lr)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs, eta_min=lr * 0.01)
-    loss_fn = CombinedLoss(lpips_weight=tr.get("lpips_weight", 0.0))
+    loss_fn = CombinedLoss(lpips_weight=tr.get("lpips_weight", 0.0),
+                           de_weight=tr.get("de_weight", 0.0))
     lam_mono = tr.get("lambda_monotonicity", 0.0)
     lam_tv   = tr.get("lambda_tv", 0.0)
 
@@ -384,7 +403,8 @@ def train(cfg: dict, epochs: int | None = None, resume: bool = True,
     # ── Final report on the untouched held-out TEST set ───────────────────────────
     if test_pairs:
         model.load_state_dict(torch.load(out_path, map_location=device))
-        test_ds = CachedPairDataset(test_pairs, target_brightness, crop_size, mode="eval")
+        test_ds = CachedPairDataset(test_pairs, target_brightness, crop_size, mode="eval",
+                                    brightness_norm=brightness_norm)
         test_de = evaluate_delta_e(model, test_ds, device)
         log.info("train.test_heldout", test_delta_e=round(test_de, 4), n=len(test_pairs))
         print(f"\nHeld-out TEST (gold DSCF, never trained):  ΔE2000 = {test_de:.3f}  "

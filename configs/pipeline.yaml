@@ -46,6 +46,7 @@ stage4_look:
     batch_size: 8                  # default; override per GPU with --batch CLI flag
     train_size: 640                # default crop; RTX 3060 → 800, GTX 1660 → 640
     lpips_weight: 0.15             # slightly higher for more perceptual pull
+    de_weight: 1.0                 # L* ΔE proxy loss weight (MSE in CIE L* space)
     brightness_norm: true
     target_brightness: 0.605
     lambda_monotonicity: 10.0     # LUTwithBGrid: prevents hue inversion
