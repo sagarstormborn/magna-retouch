@@ -1,13 +1,13 @@
 """
-Image-Adaptive 3D LUT — model definition and inference.
+Image-Adaptive LUT models — three architectures, all Apache-2.0 / MIT:
 
-Architecture (after HuiZeng/Image-Adaptive-3DLUT, Apache-2.0):
-  - n_luts basis LUTs (learnable 3-D colour lookup tables)
-  - Lightweight CNN classifier: predicts per-image blending weights
-  - Output = weighted sum of basis LUTs applied via trilinear interpolation
+  AdaptiveLUT3DModel  — original 3D-LUT with diverse basis init (our current model)
+  SepLUTModel         — Separable 1D+3D cascade (ECCV 2022, ImCharlesY/SepLUT)
+                        1D per-channel curves handle brightness/contrast;
+                        3D handles colour coupling. More expressive, same params.
 
-Classifier uses GlobalAveragePool so it runs at any input resolution.
-Training uses random 480p crops; inference applies the LUT at full resolution.
+Both share the same training pipeline and inference path.
+Select via configs/pipeline.yaml → stage4_look.architecture: lut3d | seplut
 """
 from pathlib import Path
 
@@ -20,38 +20,14 @@ import structlog
 log = structlog.get_logger(__name__)
 
 
-# ── Trilinear LUT interpolation (pure PyTorch) ────────────────────────────────
-
-class TrilinearInterp(nn.Module):
-    """
-    Apply a 3D LUT to an image via trilinear interpolation using grid_sample.
-    lut  : (1, D, D, D, 3) — one LUT in grid_sample "flow" layout
-    img  : (B, 3, H, W)    — pixel values in [0, 1]
-    """
-    def forward(self, lut: torch.Tensor, img: torch.Tensor) -> torch.Tensor:
-        b, c, h, w = img.shape
-        # grid_sample expects coords in [-1, 1]
-        # img pixels (R, G, B) → (x, y, z) grid coords
-        coords = img.permute(0, 2, 3, 1) * 2.0 - 1.0   # (B, H, W, 3)
-        coords = coords.unsqueeze(1)                      # (B, 1, H, W, 3)
-        # lut: (1, D, D, D, 3) → (1, 3, D, D, D) for grid_sample
-        lut_5d = lut.permute(0, 4, 1, 2, 3)
-        lut_5d = lut_5d.expand(b, -1, -1, -1, -1)
-        out = F.grid_sample(lut_5d, coords,
-                            mode="bilinear", padding_mode="border",
-                            align_corners=True)              # (B, 3, 1, H, W)
-        return out.squeeze(2)                                # (B, 3, H, W)
-
-
-# ── Lightweight classifier CNN ────────────────────────────────────────────────
+# ── Shared components ─────────────────────────────────────────────────────────
 
 class LUTClassifier(nn.Module):
     """
-    Predicts per-image blending weights over n_luts basis LUTs.
-    Works at any input resolution via GlobalAveragePool.
-    ~35 K parameters.
+    Lightweight CNN that predicts per-image blending weights.
+    GlobalAveragePool → works at any input resolution. ~35 K params.
     """
-    def __init__(self, n_luts: int = 3):
+    def __init__(self, n_out: int):
         super().__init__()
         self.net = nn.Sequential(
             nn.Conv2d(3, 16, 3, stride=2, padding=1), nn.ReLU(),
@@ -60,7 +36,7 @@ class LUTClassifier(nn.Module):
             nn.Conv2d(64, 64, 3, stride=2, padding=1), nn.ReLU(),
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
-            nn.Linear(64, n_luts),
+            nn.Linear(64, n_out),
             nn.Softmax(dim=1),
         )
 
@@ -68,89 +44,186 @@ class LUTClassifier(nn.Module):
         return self.net(x)
 
 
-# ── Full model ────────────────────────────────────────────────────────────────
+class TrilinearInterp(nn.Module):
+    """Apply one 3D LUT (B, D, D, D, 3) to (B, 3, H, W) via grid_sample."""
+    def forward(self, lut: torch.Tensor, img: torch.Tensor) -> torch.Tensor:
+        b, _, h, w = img.shape
+        coords = (img.permute(0, 2, 3, 1) * 2.0 - 1.0).unsqueeze(1)  # (B,1,H,W,3)
+        lut_5d = lut.permute(0, 4, 1, 2, 3).expand(b, -1, -1, -1, -1)
+        out = F.grid_sample(lut_5d, coords, mode="bilinear",
+                            padding_mode="border", align_corners=True)
+        return out.squeeze(2)                                            # (B,3,H,W)
+
+
+def _apply_1d_lut(img: torch.Tensor, lut_1d: torch.Tensor) -> torch.Tensor:
+    """
+    Apply per-channel 1D LUTs via linear interpolation (index-based, no grid_sample).
+    img    : (B, 3, H, W) in [0, 1]
+    lut_1d : (B, 3, D)    — one curve per channel per image
+    Returns (B, 3, H, W)
+    """
+    B, C, H, W = img.shape
+    D = lut_1d.shape[-1]
+
+    pixels = img.reshape(B, C, -1)          # (B, 3, H*W)
+    idx = pixels * (D - 1)                   # fractional LUT index in [0, D-1]
+    idx_lo = idx.long().clamp(0, D - 2)     # floor index
+    idx_hi = (idx_lo + 1).clamp(0, D - 1)  # ceil index
+    frac = (idx - idx_lo.float())           # interpolation weight
+
+    lo = lut_1d.gather(2, idx_lo)           # (B, 3, H*W)
+    hi = lut_1d.gather(2, idx_hi)
+    out = lo + frac * (hi - lo)             # linear interpolation
+    return out.reshape(B, C, H, W)
+
+
+# ── Diverse initialisation helpers ────────────────────────────────────────────
+
+def _diverse_3d_luts(n: int, d: int) -> torch.Tensor:
+    """Identity + brightness-boost + warm-grade basis LUTs. Prevents classifier collapse."""
+    lin = torch.linspace(0, 1, d)
+    r, g, b = torch.meshgrid(lin, lin, lin, indexing="ij")
+    identity = torch.stack([r, g, b], dim=-1)
+    luts = []
+    for i in range(n):
+        if i == 0:
+            luts.append(identity.clone())
+        elif i == 1:
+            luts.append(identity.clone().pow(0.75))        # brighten (γ < 1)
+        elif i == 2:
+            w = identity.clone()
+            w[..., 0] = (w[..., 0] * 1.05).clamp(0, 1)   # R+5%
+            w[..., 2] = (w[..., 2] * 0.95).clamp(0, 1)   # B−5%
+            luts.append(w)
+        else:
+            luts.append(identity.clone() + torch.randn_like(identity) * 0.02)
+    return torch.stack(luts)                                # (n, D, D, D, 3)
+
+
+def _diverse_1d_luts(n: int, d: int) -> torch.Tensor:
+    """Identity + s-curve + linear-shift basis 1D LUTs per channel."""
+    lin = torch.linspace(0, 1, d)
+    identity = lin.unsqueeze(0).expand(3, -1)               # (3, D)
+    luts = []
+    for i in range(n):
+        if i == 0:
+            luts.append(identity.clone())
+        elif i == 1:
+            # Soft S-curve: lifts midtones
+            t = lin
+            s = 3 * t**2 - 2 * t**3                        # smoothstep
+            luts.append(s.unsqueeze(0).expand(3, -1).clone())
+        elif i == 2:
+            # Linear lift: shifts entire curve up (overall brightening)
+            luts.append((identity + 0.05).clamp(0, 1).clone())
+        else:
+            luts.append((identity + torch.randn_like(identity) * 0.01).clamp(0, 1))
+    return torch.stack(luts)                                # (n, 3, D)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Model 1: AdaptiveLUT3DModel  (current baseline, kept for comparison)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class AdaptiveLUT3DModel(nn.Module):
     def __init__(self, n_luts: int = 3, lut_size: int = 33):
         super().__init__()
-        d = lut_size
         self.lut_size = lut_size
         self.n_luts = n_luts
-
-        # Basis LUTs — identity-initialised so untrained model = passthrough
-        self.luts = nn.Parameter(self._identity_lut(n_luts, d))
+        self.luts = nn.Parameter(_diverse_3d_luts(n_luts, lut_size))
         self.classifier = LUTClassifier(n_luts)
         self.interp = TrilinearInterp()
 
-    @staticmethod
-    def _identity_lut(n: int, d: int) -> torch.Tensor:
-        """
-        Initialise basis LUTs with diversity so the classifier has a meaningful
-        gradient from step 1. All-identical identity init causes classifier collapse
-        (weights like [0,0,1]) and the model degenerates to a single LUT.
-
-        Basis LUT roles:
-          0 — neutral identity (passthrough)
-          1 — brightness boost (~+0.3 stop, for underexposed rooms)
-          2 — warm grade (slight R+, B−, to approximate Matt's neutral-warm target)
-          3+ — small random perturbations for remaining slots
-        """
-        lin = torch.linspace(0, 1, d)
-        r, g, b = torch.meshgrid(lin, lin, lin, indexing="ij")
-        identity = torch.stack([r, g, b], dim=-1)      # (D, D, D, 3)
-
-        luts = []
-        for i in range(n):
-            if i == 0:
-                lut = identity.clone()
-            elif i == 1:
-                # Brightness boost: gamma < 1 brightens (x^0.75)
-                lut = identity.clone().pow(0.75)
-            elif i == 2:
-                # Warm colour grade: lift R, suppress B slightly
-                lut = identity.clone()
-                lut[..., 0] = (identity[..., 0] * 1.05).clamp(0, 1)  # R +5%
-                lut[..., 2] = (identity[..., 2] * 0.95).clamp(0, 1)  # B −5%
-            else:
-                # Random perturbation for additional slots
-                lut = identity.clone() + torch.randn_like(identity) * 0.02
-            luts.append(lut)
-
-        return torch.stack(luts, dim=0)   # (n, D, D, D, 3)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        weights = self.classifier(x)                     # (B, n_luts)
-        # Blend basis LUTs: (B, 1, 1, 1, 1) × (n, D, D, D, 3) summed over n
+        weights = self.classifier(x)                         # (B, n_luts)
         lut = (weights[:, :, None, None, None, None] *
-               self.luts.unsqueeze(0)).sum(dim=1)        # (B, D, D, D, 3)
-        lut = lut.unsqueeze(0) if lut.dim() == 4 else lut
-        # Apply per-image
+               self.luts.unsqueeze(0)).sum(dim=1)            # (B, D, D, D, 3)
         out = []
         for i in range(x.shape[0]):
             out.append(self.interp(lut[i:i+1], x[i:i+1]))
         return torch.cat(out, dim=0)
 
 
-# ── Load / apply ──────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# Model 2: SepLUTModel  (ECCV 2022 — separable 1D→3D cascade)
+#
+# Key idea: component-independent (1D per-channel) followed by
+# component-correlated (3D colour coupling). More expressive than pure 3D.
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def load_model(cfg: dict, device: str = "cpu") -> AdaptiveLUT3DModel:
+class SepLUTModel(nn.Module):
+    def __init__(self, n_1d: int = 3, n_3d: int = 3,
+                 lut_1d_size: int = 64, lut_3d_size: int = 33):
+        super().__init__()
+        self.n_1d = n_1d
+        self.n_3d = n_3d
+
+        # Basis 1D LUTs: (n_1d, 3, D_1d) — one curve per channel
+        self.luts_1d = nn.Parameter(_diverse_1d_luts(n_1d, lut_1d_size))
+        # Basis 3D LUTs: (n_3d, D_3d, D_3d, D_3d, 3)
+        self.luts_3d = nn.Parameter(_diverse_3d_luts(n_3d, lut_3d_size))
+
+        # Separate classifiers — 1D classifier sees raw image,
+        # 3D classifier sees image after 1D correction (content-aware blending)
+        self.classifier_1d = LUTClassifier(n_1d)
+        self.classifier_3d = LUTClassifier(n_3d)
+        self.interp = TrilinearInterp()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B = x.shape[0]
+
+        # ── Stage 1: blend + apply 1D LUTs ────────────────────────────────────
+        w1d = self.classifier_1d(x)                          # (B, n_1d)
+        lut_1d = (w1d[:, :, None, None] *
+                  self.luts_1d.unsqueeze(0)).sum(dim=1)      # (B, 3, D_1d)
+        x_1d = _apply_1d_lut(x, lut_1d)                    # (B, 3, H, W)
+
+        # ── Stage 2: blend + apply 3D LUT on the 1D-corrected image ───────────
+        # Use x_1d for classification so the 3D LUT adapts to colour-shifted content
+        w3d = self.classifier_3d(x_1d)                      # (B, n_3d)
+        lut_3d = (w3d[:, :, None, None, None, None] *
+                  self.luts_3d.unsqueeze(0)).sum(dim=1)      # (B, D, D, D, 3)
+        out = []
+        for i in range(B):
+            out.append(self.interp(lut_3d[i:i+1], x_1d[i:i+1]))
+        return torch.cat(out, dim=0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Factory, load, apply
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def build_model(cfg: dict) -> nn.Module:
+    s4 = cfg["stage4_look"]
+    arch = s4.get("architecture", "lut3d")
+    if arch == "seplut":
+        return SepLUTModel(
+            n_1d=s4.get("n_1d_luts", 3),
+            n_3d=s4.get("n_3d_luts", 3),
+            lut_1d_size=s4.get("lut_1d_size", 64),
+            lut_3d_size=s4.get("lut_size", 33),
+        )
+    return AdaptiveLUT3DModel(
+        n_luts=s4.get("n_luts", 3),
+        lut_size=s4.get("lut_size", 33),
+    )
+
+
+def load_model(cfg: dict, device: str = "cpu") -> nn.Module:
     model_path = Path(cfg["stage4_look"]["lut_model_path"])
     if not model_path.exists():
         raise FileNotFoundError(
-            f"LUT model not found at {model_path}.\n"
-            "Train first:  make train"
+            f"LUT model not found at {model_path}.\nTrain first: make train"
         )
-    model = AdaptiveLUT3DModel(
-        n_luts=cfg["stage4_look"].get("n_luts", 3),
-        lut_size=cfg["stage4_look"]["lut_size"],
-    )
+    model = build_model(cfg)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval().to(device)
-    log.info("stage4.model_loaded", path=str(model_path))
+    log.info("stage4.model_loaded", path=str(model_path),
+             arch=cfg["stage4_look"].get("architecture", "lut3d"))
     return model
 
 
-def apply_lut(img_uint8: np.ndarray, model: AdaptiveLUT3DModel, device: str = "cpu") -> np.ndarray:
+def apply_lut(img_uint8: np.ndarray, model: nn.Module, device: str = "cpu") -> np.ndarray:
     """Run LUT inference on a uint8 HxWx3 RGB image. Returns uint8."""
     f32 = img_uint8.astype(np.float32) / 255.0
     t = torch.from_numpy(f32.transpose(2, 0, 1)).unsqueeze(0).to(device)

@@ -24,7 +24,7 @@ import structlog
 
 from src.common.config import load_config
 from src.common.logging import setup_logging
-from .lut3d import AdaptiveLUT3DModel
+from .lut3d import build_model
 
 log = structlog.get_logger(__name__)
 
@@ -172,11 +172,10 @@ def train(cfg: dict, epochs: int | None = None, resume: bool = True):
     lr         = tr["lr"]
     batch_size = tr["batch_size"]
     crop_size  = tr.get("train_size", 480)
-    n_luts     = s4.get("n_luts", 3)
-    lut_size   = s4["lut_size"]
+    arch       = s4.get("architecture", "lut3d")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    log.info("train.start", device=device, epochs=n_epochs, lr=lr, n_luts=n_luts)
+    log.info("train.start", device=device, epochs=n_epochs, lr=lr, arch=arch)
 
     # Data
     brightness_norm = tr.get("brightness_norm", True)
@@ -185,8 +184,8 @@ def train(cfg: dict, epochs: int | None = None, resume: bool = True):
     dl = DataLoader(ds, batch_size=batch_size, shuffle=True,
                     num_workers=0, pin_memory=False)
 
-    # Model
-    model = AdaptiveLUT3DModel(n_luts=n_luts, lut_size=lut_size).to(device)
+    # Model — selected by config
+    model = build_model(cfg).to(device)
     out_path = Path(s4["lut_model_path"])
     out_path.parent.mkdir(parents=True, exist_ok=True)
 

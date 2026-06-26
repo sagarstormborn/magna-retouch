@@ -27,18 +27,22 @@ stage3_wb:
 
 stage4_look:
   method: lut3d                    # lut3d | hdrnet
-  lut_size: 33
-  n_luts: 3
+  architecture: seplut             # lut3d | seplut  (seplut = 1D+3D cascade, ECCV 2022)
+  lut_size: 33                     # 3D LUT grid size
+  lut_1d_size: 64                  # 1D per-channel curve size (seplut only)
+  n_luts: 3                        # basis 3D LUTs (lut3d) / basis 3D LUTs (seplut stage 2)
+  n_1d_luts: 3                     # basis 1D LUTs (seplut only)
+  n_3d_luts: 3                     # alias — same as n_luts for seplut
   lut_model_path: models/lut3d/model_best.pth
   hdrnet_model_path: models/hdrnet/model_best.pth
   train:
     n_epochs: 400
-    lr: 0.0002                     # slightly higher — diverse init needs faster LUT updates
+    lr: 0.0002
     batch_size: 4
     train_size: 480
-    lpips_weight: 0.1              # perceptual loss — drives colour grade toward Matt's look
-    brightness_norm: true          # normalise input brightness to training median before S4
-    target_brightness: 0.609       # Matt's median output brightness (measured from 21 pairs)
+    lpips_weight: 0.1
+    brightness_norm: true
+    target_brightness: 0.605       # Matt's median output brightness (measured from 58 pairs)
 
 stage5_benchmark:
   delta_e_threshold: 2.0           # ΔE2000 target ≲ 2 (Matt criterion 3)

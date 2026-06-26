@@ -3,7 +3,7 @@ from pathlib import Path
 import numpy as np
 import structlog
 
-from .lut3d import load_model, apply_lut
+from .lut3d import load_model, apply_lut   # load_model uses build_model internally
 
 log = structlog.get_logger(__name__)
 
