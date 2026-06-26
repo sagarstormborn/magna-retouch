@@ -167,7 +167,14 @@ class CombinedLoss(nn.Module):
         if self.lpips_weight > 0:
             net = self._get_lpips(pred.device)
             if net is not None:
-                loss = loss + self.lpips_weight * net(pred * 2 - 1, target * 2 - 1).mean()
+                # LPIPS is designed for ~256px inputs; resize to avoid O(n^2) cost
+                # on large crops. Perceptual quality is scale-invariant at this size.
+                if pred.shape[-1] > 256:
+                    p = torch.nn.functional.interpolate(pred,   size=256, mode="bilinear", antialias=True)
+                    t = torch.nn.functional.interpolate(target, size=256, mode="bilinear", antialias=True)
+                else:
+                    p, t = pred, target
+                loss = loss + self.lpips_weight * net(p * 2 - 1, t * 2 - 1).mean()
         return loss
 
 
@@ -204,9 +211,12 @@ def train(cfg: dict, epochs: int | None = None, resume: bool = True,
     ds = CachedPairDataset(Path("data/train/our_input"), Path("data/train/our_target"),
                            crop_size=crop_size, augment=True,
                            brightness_norm=brightness_norm)
-    # num_workers=0: data is already in RAM, workers add IPC overhead
+    # 2 workers: fork shares the numpy arrays (no copy) → parallel crop/augment
+    # while GPU is computing the previous batch
+    on_gpu = (device == "cuda")
     dl = DataLoader(ds, batch_size=batch_size, shuffle=True,
-                    num_workers=0, pin_memory=(device == "cuda"))
+                    num_workers=2 if on_gpu else 0,
+                    pin_memory=on_gpu, persistent_workers=on_gpu)
 
     # Model
     model = build_model(cfg_run).to(device)
