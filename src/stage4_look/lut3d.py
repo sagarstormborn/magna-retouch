@@ -24,24 +24,42 @@ log = structlog.get_logger(__name__)
 
 class LUTClassifier(nn.Module):
     """
-    Lightweight CNN that predicts per-image blending weights.
-    GlobalAveragePool → works at any input resolution. ~35 K params.
+    Image backbone that predicts per-image LUT blending weights.
+
+    backbone="resnet18" (default): pretrained ResNet-18 truncated at pool layer
+        → 512-dim features → Linear → softmax. 11 M params.  ImageNet pretrained
+        features understand image content (exposure zones, colour casts, room type)
+        far better than a 4-conv net trained from scratch on 70 images.
+
+    backbone="lightweight": original 4-conv, ~35 K params. Kept for CPU/small-GPU.
     """
-    def __init__(self, n_out: int):
+    def __init__(self, n_out: int, backbone: str = "resnet18"):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(3, 16, 3, stride=2, padding=1), nn.ReLU(),
-            nn.Conv2d(16, 32, 3, stride=2, padding=1), nn.ReLU(),
-            nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.ReLU(),
-            nn.Conv2d(64, 64, 3, stride=2, padding=1), nn.ReLU(),
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(64, n_out),
-            nn.Softmax(dim=1),
-        )
+        self.backbone_name = backbone
+        if backbone == "resnet18":
+            import torchvision.models as M
+            r = M.resnet18(weights=M.ResNet18_Weights.IMAGENET1K_V1)
+            # Drop the final FC; keep everything through avgpool
+            self.feat = nn.Sequential(*list(r.children())[:-1], nn.Flatten())
+            feat_dim = 512
+        else:
+            self.feat = nn.Sequential(
+                nn.Conv2d(3, 16, 3, stride=2, padding=1), nn.ReLU(),
+                nn.Conv2d(16, 32, 3, stride=2, padding=1), nn.ReLU(),
+                nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.ReLU(),
+                nn.Conv2d(64, 64, 3, stride=2, padding=1), nn.ReLU(),
+                nn.AdaptiveAvgPool2d(1), nn.Flatten(),
+            )
+            feat_dim = 64
+        self.head = nn.Sequential(nn.Linear(feat_dim, n_out), nn.Softmax(dim=1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        # ResNet expects at least 224×224; downsample large crops for the backbone
+        if self.backbone_name == "resnet18" and min(x.shape[-2:]) > 256:
+            x_small = F.interpolate(x, size=224, mode="bilinear", antialias=True)
+        else:
+            x_small = x
+        return self.head(self.feat(x_small))
 
 
 class TrilinearInterp(nn.Module):
@@ -126,12 +144,12 @@ def _diverse_1d_luts(n: int, d: int) -> torch.Tensor:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class AdaptiveLUT3DModel(nn.Module):
-    def __init__(self, n_luts: int = 3, lut_size: int = 33):
+    def __init__(self, n_luts: int = 3, lut_size: int = 33, backbone: str = "resnet18"):
         super().__init__()
         self.lut_size = lut_size
         self.n_luts = n_luts
         self.luts = nn.Parameter(_diverse_3d_luts(n_luts, lut_size))
-        self.classifier = LUTClassifier(n_luts)
+        self.classifier = LUTClassifier(n_luts, backbone=backbone)
         self.interp = TrilinearInterp()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -153,34 +171,52 @@ class AdaptiveLUT3DModel(nn.Module):
 
 class SepLUTModel(nn.Module):
     def __init__(self, n_1d: int = 3, n_3d: int = 3,
-                 lut_1d_size: int = 64, lut_3d_size: int = 33):
+                 lut_1d_size: int = 64, lut_3d_size: int = 33,
+                 backbone: str = "resnet18"):
         super().__init__()
         self.n_1d = n_1d
         self.n_3d = n_3d
 
-        # Basis 1D LUTs: (n_1d, 3, D_1d) — one curve per channel
         self.luts_1d = nn.Parameter(_diverse_1d_luts(n_1d, lut_1d_size))
-        # Basis 3D LUTs: (n_3d, D_3d, D_3d, D_3d, 3)
         self.luts_3d = nn.Parameter(_diverse_3d_luts(n_3d, lut_3d_size))
 
-        # Separate classifiers — 1D classifier sees raw image,
-        # 3D classifier sees image after 1D correction (content-aware blending)
-        self.classifier_1d = LUTClassifier(n_1d)
-        self.classifier_3d = LUTClassifier(n_3d)
+        # Shared ResNet-18 backbone — both 1D and 3D classifiers reuse features
+        # without duplicating the 11M-param network
+        if backbone == "resnet18":
+            import torchvision.models as M
+            r = M.resnet18(weights=M.ResNet18_Weights.IMAGENET1K_V1)
+            self.backbone = nn.Sequential(*list(r.children())[:-1], nn.Flatten())
+            feat_dim = 512
+        else:
+            self.backbone = nn.Sequential(
+                nn.Conv2d(3, 16, 3, stride=2, padding=1), nn.ReLU(),
+                nn.Conv2d(16, 32, 3, stride=2, padding=1), nn.ReLU(),
+                nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.ReLU(),
+                nn.Conv2d(64, 64, 3, stride=2, padding=1), nn.ReLU(),
+                nn.AdaptiveAvgPool2d(1), nn.Flatten(),
+            )
+            feat_dim = 64
+        self.backbone_name = backbone
+        self.head_1d = nn.Sequential(nn.Linear(feat_dim, n_1d), nn.Softmax(dim=1))
+        self.head_3d = nn.Sequential(nn.Linear(feat_dim, n_3d), nn.Softmax(dim=1))
         self.interp = TrilinearInterp()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B = x.shape[0]
 
-        # ── Stage 1: blend + apply 1D LUTs ────────────────────────────────────
-        w1d = self.classifier_1d(x)                          # (B, n_1d)
+        # Shared backbone (single forward pass — shared features for both heads)
+        x_small = F.interpolate(x, 224, mode="bilinear", antialias=True) \
+                  if self.backbone_name == "resnet18" and min(x.shape[-2:]) > 256 else x
+        feats = self.backbone(x_small)                       # (B, feat_dim)
+
+        # ── Stage 1: 1D LUT (per-channel tone curves) ────────────────────────
+        w1d  = self.head_1d(feats)                           # (B, n_1d)
         lut_1d = (w1d[:, :, None, None] *
                   self.luts_1d.unsqueeze(0)).sum(dim=1)      # (B, 3, D_1d)
-        x_1d = _apply_1d_lut(x, lut_1d)                    # (B, 3, H, W)
+        x_1d = _apply_1d_lut(x, lut_1d)                     # (B, 3, H, W)
 
-        # ── Stage 2: blend + apply 3D LUT on the 1D-corrected image ───────────
-        # Use x_1d for classification so the 3D LUT adapts to colour-shifted content
-        w3d = self.classifier_3d(x_1d)                      # (B, n_3d)
+        # ── Stage 2: 3D LUT (colour coupling) ───────────────────────────────
+        w3d  = self.head_3d(feats)                           # (B, n_3d)
         lut_3d = (w3d[:, :, None, None, None, None] *
                   self.luts_3d.unsqueeze(0)).sum(dim=1)      # (B, D, D, D, 3)
         out = []
@@ -196,12 +232,14 @@ class SepLUTModel(nn.Module):
 def build_model(cfg: dict) -> nn.Module:
     s4 = cfg["stage4_look"]
     arch = s4.get("architecture", "lut3d")
+    backbone = s4.get("backbone", "resnet18")
     if arch == "seplut":
         return SepLUTModel(
             n_1d=s4.get("n_1d_luts", 3),
             n_3d=s4.get("n_3d_luts", 3),
             lut_1d_size=s4.get("lut_1d_size", 64),
             lut_3d_size=s4.get("lut_size", 33),
+            backbone=backbone,
         )
     if arch == "lutwithbgrid":
         from .lut_bilateral import build_bilateral_model
@@ -209,6 +247,7 @@ def build_model(cfg: dict) -> nn.Module:
     return AdaptiveLUT3DModel(
         n_luts=s4.get("n_luts", 3),
         lut_size=s4.get("lut_size", 33),
+        backbone=backbone,
     )
 
 

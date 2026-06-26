@@ -121,19 +121,15 @@ class LUTwithBGridModel(nn.Module):
         self.grids = nn.Parameter(
             _identity_grid(n_grid_basis, grid_size, n_grid_channels))
 
-        # Shared CNN backbone — produces per-image features for both classifiers
-        self.backbone = nn.Sequential(
-            nn.Conv2d(3, 16, 3, stride=2, padding=1), nn.ReLU(),
-            nn.Conv2d(16, 32, 3, stride=2, padding=1), nn.ReLU(),
-            nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.ReLU(),
-            nn.Conv2d(64, 64, 3, stride=2, padding=1), nn.ReLU(),
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-        )
+        # ResNet-18 backbone — pretrained ImageNet features for both LUT and grid heads
+        import torchvision.models as M
+        r = M.resnet18(weights=M.ResNet18_Weights.IMAGENET1K_V1)
+        self.backbone = nn.Sequential(*list(r.children())[:-1], nn.Flatten())
+        feat_dim = 512
 
         # Separate heads for LUT vs grid weights
-        self.lut_head  = nn.Sequential(nn.Linear(64, n_lut_basis),  nn.Softmax(dim=1))
-        self.grid_head = nn.Sequential(nn.Linear(64, n_grid_basis),  nn.Softmax(dim=1))
+        self.lut_head  = nn.Sequential(nn.Linear(feat_dim, n_lut_basis), nn.Softmax(dim=1))
+        self.grid_head = nn.Sequential(nn.Linear(feat_dim, n_grid_basis), nn.Softmax(dim=1))
 
         # 1×1 conv: cat([img(3), local_grid(C)]) → 3
         # Input layout: channels 0-2 = image, channels 3+ = grid features
@@ -149,7 +145,9 @@ class LUTwithBGridModel(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B = x.shape[0]
 
-        features = self.backbone(x)                          # (B, 64)
+        x_small = F.interpolate(x, 224, mode="bilinear", antialias=True) \
+                  if min(x.shape[-2:]) > 256 else x
+        features = self.backbone(x_small)                    # (B, 512)
 
         # ── Global 3D LUT (image-adaptive colour grade) ───────────────────────
         lut_w = self.lut_head(features)                      # (B, n_lut_basis)

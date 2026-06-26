@@ -27,15 +27,16 @@ stage3_wb:
 
 stage4_look:
   method: lut3d                    # lut3d | hdrnet
-  architecture: lutwithbgrid       # lut3d | seplut | lutwithbgrid (spatial corrections)
+  architecture: seplut             # lut3d | seplut | lutwithbgrid
+  backbone: resnet18               # resnet18 (pretrained, 11M) | lightweight (35K)
   lut_size: 33                     # 3D LUT grid size
   lut_1d_size: 64                  # 1D per-channel curve size (seplut only)
-  n_luts: 3                        # basis 3D LUTs
-  n_1d_luts: 3                     # basis 1D LUTs (seplut only)
-  n_3d_luts: 3
+  n_luts: 8                        # basis 3D LUTs — more = more expressive
+  n_1d_luts: 8                     # basis 1D LUTs (seplut only)
+  n_3d_luts: 8
   # LUTwithBGrid-specific
-  n_lut_basis: 3                   # basis 3D LUTs for global grade
-  n_grid_basis: 4                  # basis bilateral grids for spatial correction
+  n_lut_basis: 8                   # basis 3D LUTs for global grade
+  n_grid_basis: 6                  # basis bilateral grids for spatial correction
   grid_size: 17                    # bilateral grid resolution
   n_grid_channels: 3               # per-node channels (3 = additive RGB offset)
   lut_model_path: models/lut3d/model_best.pth
