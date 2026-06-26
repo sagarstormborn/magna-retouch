@@ -139,22 +139,28 @@ class CombinedLoss(nn.Module):
         self.mse = nn.MSELoss()
         self.lpips_weight = lpips_weight
         self._lpips = None
+        self._lpips_device = None
 
-    def _get_lpips(self):
+    def _get_lpips(self, device):
         if self._lpips is None:
             try:
                 import lpips
-                self._lpips = lpips.LPIPS(net="alex")
-                log.info("loss.lpips_enabled")
+                self._lpips = lpips.LPIPS(net="alex").to(device)
+                self._lpips_device = device
+                log.info("loss.lpips_enabled", device=str(device))
             except ImportError:
                 log.warning("loss.lpips_not_installed_falling_back_to_mse")
                 self.lpips_weight = 0.0
+        elif str(self._lpips_device) != str(device):
+            # Move to new device if needed (e.g. GPU training after CPU init)
+            self._lpips = self._lpips.to(device)
+            self._lpips_device = device
         return self._lpips
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         loss = self.mse(pred, target)
         if self.lpips_weight > 0:
-            net = self._get_lpips()
+            net = self._get_lpips(pred.device)
             if net is not None:
                 # lpips expects [-1, 1]
                 p = pred  * 2 - 1
