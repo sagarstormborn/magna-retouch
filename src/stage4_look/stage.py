@@ -33,12 +33,15 @@ def process(img: np.ndarray, cfg: dict) -> np.ndarray:
     scale_applied = 1.0
 
     if s4["train"].get("brightness_norm", False):
+        import math
         target_brightness = s4["train"].get("target_brightness", 0.609)
         inp_f32 = img.astype(np.float32) / 255.0
         inp_mean = inp_f32.mean()
-        if inp_mean > 1e-4:
-            scale_applied = target_brightness / inp_mean
-            inp = np.clip(inp_f32 * scale_applied, 0, 1)
+        if inp_mean > 1e-4 and inp_mean < 0.999:
+            gamma = math.log(target_brightness) / math.log(inp_mean)
+            gamma = float(max(0.3, min(3.0, gamma)))
+            scale_applied = gamma
+            inp = np.power(np.clip(inp_f32, 1e-8, 1.0), gamma)
             inp = (inp * 255).astype(np.uint8)
 
     result = apply_lut(inp, _model_cache[key], device)

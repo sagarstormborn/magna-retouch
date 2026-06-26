@@ -36,7 +36,7 @@ stage4_look:
     lr: 0.0002                     # slightly higher — diverse init needs faster LUT updates
     batch_size: 4
     train_size: 480
-    lpips_weight: 0.0              # set to 0.1 after pip install lpips
+    lpips_weight: 0.1              # perceptual loss — drives colour grade toward Matt's look
     brightness_norm: true          # normalise input brightness to training median before S4
     target_brightness: 0.609       # Matt's median output brightness (measured from 21 pairs)
 

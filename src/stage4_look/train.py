@@ -83,13 +83,15 @@ class PairDataset(Dataset):
         inp = _load_rgb_f32(inp_path)
         tgt = _load_rgb_f32(tgt_path)
 
-        # Brightness normalisation: scale input to match target median brightness.
-        # Prevents the LUT from learning per-image exposure instead of colour grade.
+        # Brightness normalisation via gamma: maps current mean → target mean
+        # without clipping highlights. gamma = log(target)/log(current) maps
+        # the entire [0,1] range so dark images lift without blowing highlights.
         if self.target_brightness is not None:
             inp_mean = inp.mean()
-            if inp_mean > 1e-4:
-                scale = self.target_brightness / inp_mean
-                inp = np.clip(inp * scale, 0, 1)
+            if inp_mean > 1e-4 and inp_mean < 0.999:
+                gamma = np.log(self.target_brightness) / np.log(inp_mean)
+                gamma = float(np.clip(gamma, 0.3, 3.0))   # safety bounds
+                inp = np.power(np.clip(inp, 1e-8, 1.0), gamma)
 
         # Resize target to match input dimensions (C1 TIF > Matt JPG)
         if inp.shape[:2] != tgt.shape[:2]:
