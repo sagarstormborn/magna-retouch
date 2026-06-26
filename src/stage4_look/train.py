@@ -263,8 +263,10 @@ class CombinedLoss(nn.Module):
             # Y ≈ 0.2126R + 0.7152G + 0.0722B
             coeff = torch.tensor([0.2126, 0.7152, 0.0722],
                                  device=pred.device).view(1, 3, 1, 1)
-            p_L = 116 * (p_lin * coeff).sum(1, keepdim=True).clamp(1e-8).pow(1/3) - 16
-            t_L = 116 * (t_lin * coeff).sum(1, keepdim=True).clamp(1e-8).pow(1/3) - 16
+            # Normalise to [0,1] so de_weight is comparable to MSE/LPIPS scale
+            # L* ∈ [0,100] → divide by 100 before MSE
+            p_L = (116 * (p_lin * coeff).sum(1, keepdim=True).clamp(1e-8).pow(1/3) - 16) / 100.0
+            t_L = (116 * (t_lin * coeff).sum(1, keepdim=True).clamp(1e-8).pow(1/3) - 16) / 100.0
             loss = loss + self.de_weight * F.mse_loss(p_L, t_L)
         return loss
 
