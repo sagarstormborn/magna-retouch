@@ -1,13 +1,16 @@
 """
 Image-Adaptive LUT models — three architectures, all Apache-2.0 / MIT:
 
-  AdaptiveLUT3DModel  — original 3D-LUT with diverse basis init (our current model)
-  SepLUTModel         — Separable 1D+3D cascade (ECCV 2022, ImCharlesY/SepLUT)
-                        1D per-channel curves handle brightness/contrast;
-                        3D handles colour coupling. More expressive, same params.
+  AdaptiveLUT3DModel  — original 3D-LUT with diverse basis init
+  SepLUTModel         — Separable 1D+3D cascade (ECCV 2022) + optional metadata conditioning
+  LUTwithBGridModel   — Bilateral grid + 3D LUT (ECCV 2024, in lut_bilateral.py)
 
-Both share the same training pipeline and inference path.
-Select via configs/pipeline.yaml → stage4_look.architecture: lut3d | seplut
+Metadata conditioning (Tier-1 recommendation from research):
+  5-dim vector: [log_brightness, sin(hour), cos(hour), sin(month), cos(month)]
+  - log_brightness: computed from the image itself (interior/exterior proxy)
+  - sin/cos(hour): time of day cyclical encoding
+  - sin/cos(month): season cyclical encoding
+  Encoded → 32-dim MLP → concat with ResNet 512-dim → 544-dim → LUT heads
 """
 from pathlib import Path
 
@@ -18,6 +21,61 @@ import torch.nn.functional as F
 import structlog
 
 log = structlog.get_logger(__name__)
+
+
+# ── Metadata encoder ─────────────────────────────────────────────────────────
+
+def encode_metadata(images: torch.Tensor,
+                    hour: torch.Tensor | None = None,
+                    month: torch.Tensor | None = None) -> torch.Tensor:
+    """
+    Build 5-dim metadata vector from the input image + optional datetime.
+
+    Features:
+      0: log_brightness  — log10(mean pixel value + 0.01), encodes indoor/outdoor
+                           (dark interior ≈ -1.2, bright exterior ≈ -0.5)
+      1-2: sin/cos(hour) — time of day, cyclical [0,24]
+      3-4: sin/cos(month)— season, cyclical [1,12]
+
+    log_brightness is always computed from the image itself so it works even when
+    no EXIF is available. hour/month default to noon (12h) / June (6) when absent.
+    """
+    B = images.shape[0]
+    dev = images.device
+    dtype = images.dtype
+
+    # Scene brightness — single most informative feature for interior vs exterior
+    brightness = images.mean(dim=(1, 2, 3)).clamp(min=1e-4)  # (B,)
+    log_b = torch.log10(brightness).unsqueeze(1)               # (B,1)
+
+    # Time of day (default: noon = 12h)
+    if hour is None:
+        hour = torch.full((B,), 12.0, device=dev, dtype=dtype)
+    h_norm = hour * (2 * 3.14159265 / 24.0)
+    h_sin = torch.sin(h_norm).unsqueeze(1)
+    h_cos = torch.cos(h_norm).unsqueeze(1)
+
+    # Month / season (default: June = 6)
+    if month is None:
+        month = torch.full((B,), 6.0, device=dev, dtype=dtype)
+    m_norm = month * (2 * 3.14159265 / 12.0)
+    m_sin = torch.sin(m_norm).unsqueeze(1)
+    m_cos = torch.cos(m_norm).unsqueeze(1)
+
+    return torch.cat([log_b, h_sin, h_cos, m_sin, m_cos], dim=1)  # (B, 5)
+
+
+class MetaEncoder(nn.Module):
+    """5-dim metadata → 32-dim embedding with dropout regularisation."""
+    def __init__(self, meta_dim: int = 5, out_dim: int = 32):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(meta_dim, 32), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(32, out_dim),
+        )
+
+    def forward(self, meta: torch.Tensor) -> torch.Tensor:
+        return self.net(meta)
 
 
 # ── Shared components ─────────────────────────────────────────────────────────
@@ -207,26 +265,35 @@ class SepLUTModel(nn.Module):
             )
             feat_dim = 64
         self.backbone_name = backbone
-        self.head_1d = nn.Sequential(nn.Dropout(0.3), nn.Linear(feat_dim, n_1d), nn.Softmax(dim=1))
-        self.head_3d = nn.Sequential(nn.Dropout(0.3), nn.Linear(feat_dim, n_3d), nn.Softmax(dim=1))
+        self.meta_encoder = MetaEncoder(meta_dim=5, out_dim=32)
+        combined_dim = feat_dim + 32   # 512 + 32 = 544
+        self.head_1d = nn.Sequential(nn.Dropout(0.3), nn.Linear(combined_dim, n_1d), nn.Softmax(dim=1))
+        self.head_3d = nn.Sequential(nn.Dropout(0.3), nn.Linear(combined_dim, n_3d), nn.Softmax(dim=1))
         self.interp = TrilinearInterp()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor,
+                hour: torch.Tensor | None = None,
+                month: torch.Tensor | None = None) -> torch.Tensor:
         B = x.shape[0]
 
-        # Shared backbone (single forward pass — shared features for both heads)
+        # Shared backbone (single forward pass)
         x_small = F.interpolate(x, 224, mode="bilinear", antialias=True) \
                   if self.backbone_name == "resnet18" and min(x.shape[-2:]) > 256 else x
-        feats = self.backbone(x_small)                       # (B, feat_dim)
+        feats = self.backbone(x_small)                       # (B, 512)
+
+        # Metadata conditioning: 5-dim → 32-dim, concat with image features
+        meta  = encode_metadata(x, hour, month)              # (B, 5)
+        meta_emb = self.meta_encoder(meta)                   # (B, 32)
+        feats_cond = torch.cat([feats, meta_emb], dim=1)    # (B, 544)
 
         # ── Stage 1: 1D LUT (per-channel tone curves) ────────────────────────
-        w1d  = self.head_1d(feats)                           # (B, n_1d)
+        w1d  = self.head_1d(feats_cond)                      # (B, n_1d)
         lut_1d = (w1d[:, :, None, None] *
                   self.luts_1d.unsqueeze(0)).sum(dim=1)      # (B, 3, D_1d)
         x_1d = _apply_1d_lut(x, lut_1d)                     # (B, 3, H, W)
 
         # ── Stage 2: 3D LUT (colour coupling) ───────────────────────────────
-        w3d  = self.head_3d(feats)                           # (B, n_3d)
+        w3d  = self.head_3d(feats_cond)                      # (B, n_3d)
         lut_3d = (w3d[:, :, None, None, None, None] *
                   self.luts_3d.unsqueeze(0)).sum(dim=1)      # (B, D, D, D, 3)
         out = []

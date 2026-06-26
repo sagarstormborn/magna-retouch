@@ -153,14 +153,20 @@ class CachedPairDataset(Dataset):
     EVAL_LONG = 768
 
     def __init__(self, pairs, target_brightness, crop_size: int = 640,
-                 mode: str = "train", brightness_norm: bool = True):
+                 mode: str = "train", brightness_norm: bool = True,
+                 metadata: dict | None = None):
         self.pairs = pairs
         self.mode = mode
         self.crop_size = crop_size
-        self.target_brightness = target_brightness   # None → per-image norm
+        self.target_brightness = target_brightness
         work_short = round(crop_size * 1.5)
 
+        # metadata[stem] = {hour, month, ...} — loaded from data/train/metadata.json
+        self.metadata = metadata or {}
+
         self.data: list[tuple[np.ndarray, np.ndarray]] = []
+        self.meta_tensors: list[tuple[float, float]] = []  # (hour, month) per pair
+
         for inp_p, tgt_p in pairs:
             inp = _load_rgb_u8(inp_p)
             tgt = _load_rgb_u8(tgt_p)
@@ -175,15 +181,19 @@ class CachedPairDataset(Dataset):
                 tgt = cv2.resize(tgt, (inp.shape[1], inp.shape[0]),
                                  interpolation=cv2.INTER_AREA)
 
-            # Brightness-normalise the INPUT to match its OWN target's brightness.
-            # Per-image: each input is gamma-shifted to its paired target's mean,
-            # eliminating the L* residual that a single global constant left behind.
+            # Per-image brightness normalisation
             if brightness_norm:
                 tgt_brightness = tgt.astype(np.float32).mean() / 255.0
                 f = _gamma_to_brightness(inp.astype(np.float32) / 255.0, tgt_brightness)
                 inp = (np.clip(f, 0, 1) * 255 + 0.5).astype(np.uint8)
 
             self.data.append((np.ascontiguousarray(inp), np.ascontiguousarray(tgt)))
+
+            # Load datetime metadata (hour, month) — default to noon/June if absent
+            stem = inp_p.stem.split("_")[0]
+            m = self.metadata.get(stem, {})
+            self.meta_tensors.append((float(m.get("hour", 12.0)),
+                                      float(m.get("month", 6.0))))
 
         log.info("dataset.cached", mode=mode, n_pairs=len(self.data), crop=crop_size,
                  brightness_norm=brightness_norm)
@@ -196,6 +206,7 @@ class CachedPairDataset(Dataset):
 
     def __getitem__(self, idx: int):
         inp, tgt = self.data[idx]
+        hour, month = self.meta_tensors[idx]
         if self.mode == "train":
             h, w = inp.shape[:2]
             c = self.crop_size
@@ -211,7 +222,7 @@ class CachedPairDataset(Dataset):
                 inp = inp[:, ::-1]; tgt = tgt[:, ::-1]
             if random.random() > 0.75:
                 inp = inp[::-1]; tgt = tgt[::-1]
-        return _to_tensor(inp), _to_tensor(tgt)
+        return _to_tensor(inp), _to_tensor(tgt), torch.tensor(hour), torch.tensor(month)
 
 
 def _to_tensor(img_u8: np.ndarray) -> torch.Tensor:
@@ -278,11 +289,16 @@ def evaluate_delta_e(model: nn.Module, dataset: CachedPairDataset, device: str) 
     """Mean ΔE2000 over a held-out dataset (full frames, no crop)."""
     model.eval()
     des = []
-    for inp_u8, tgt_u8 in dataset.data:
+    for idx, (inp_u8, tgt_u8) in enumerate(dataset.data):
         t = torch.from_numpy(
             np.ascontiguousarray(inp_u8).astype(np.float32).transpose(2, 0, 1) / 255.0
         ).unsqueeze(0).to(device)
-        out = model(t).squeeze(0).cpu().numpy().transpose(1, 2, 0)
+        hour_t  = torch.tensor([dataset.meta_tensors[idx][0]]).to(device)
+        month_t = torch.tensor([dataset.meta_tensors[idx][1]]).to(device)
+        try:
+            out = model(t, hour=hour_t, month=month_t).squeeze(0).cpu().numpy().transpose(1, 2, 0)
+        except TypeError:
+            out = model(t).squeeze(0).cpu().numpy().transpose(1, 2, 0)
         pred_u8 = (np.clip(out, 0, 1) * 255 + 0.5).astype(np.uint8)
         des.append(delta_e2000(pred_u8.astype(np.uint16) * 257,
                                tgt_u8.astype(np.uint16) * 257))
@@ -337,10 +353,15 @@ def train(cfg: dict, epochs: int | None = None, resume: bool = True,
         "model": out_path.name,
     }, indent=2))
 
+    # Load datetime metadata for conditioning (hour, month)
+    meta_path = Path("data/train/metadata.json")
+    meta_db = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+    log.info("metadata.loaded", n_entries=len(meta_db))
+
     train_ds = CachedPairDataset(train_pairs, target_brightness, crop_size, mode="train",
-                                 brightness_norm=brightness_norm)
+                                 brightness_norm=brightness_norm, metadata=meta_db)
     val_ds   = CachedPairDataset(val_pairs,   target_brightness, crop_size, mode="eval",
-                                 brightness_norm=brightness_norm)
+                                 brightness_norm=brightness_norm, metadata=meta_db)
 
     dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                     num_workers=0, pin_memory=(device == "cuda"))
@@ -365,9 +386,15 @@ def train(cfg: dict, epochs: int | None = None, resume: bool = True,
     for epoch in range(1, n_epochs + 1):
         model.train()
         epoch_loss = 0.0
-        for inp, tgt in dl:
+        for batch in dl:
+            inp, tgt, hour, month = batch
             inp, tgt = inp.to(device), tgt.to(device)
-            pred = model(inp)
+            hour, month = hour.to(device), month.to(device)
+            # Pass metadata to models that support it (SepLUTModel); others ignore kwargs
+            try:
+                pred = model(inp, hour=hour, month=month)
+            except TypeError:
+                pred = model(inp)
             loss = loss_fn(pred, tgt)
             if lam_mono > 0 and hasattr(model, "luts_3d"):
                 loss = loss + lam_mono * monotonicity_loss(model.luts_3d)
