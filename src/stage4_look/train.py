@@ -401,6 +401,10 @@ def train(cfg: dict, epochs: int | None = None, resume: bool = True,
             if lam_tv > 0 and hasattr(model, "luts_3d"):
                 loss = loss + lam_tv * tv_loss(model.luts_3d)
 
+            if not torch.isfinite(loss):
+                log.warning("train.nan_loss_skipped", epoch=epoch)
+                optimizer.zero_grad()
+                continue
             optimizer.zero_grad()
             loss.backward()
             if grad_clip > 0:
@@ -459,15 +463,19 @@ if __name__ == "__main__":
     parser.add_argument("--crop",      type=int, default=None, help="Override crop size")
     parser.add_argument("--lr",        type=float, default=None, help="Override learning rate")
     parser.add_argument("--lpips",     type=float, default=None, help="Override LPIPS weight")
+    parser.add_argument("--mono",      type=float, default=None, help="Override lambda_monotonicity (0 = disable)")
+    parser.add_argument("--tv",        type=float, default=None, help="Override lambda_tv (0 = disable)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     setup_logging(cfg["logging"]["level"], cfg["logging"]["log_dir"], "train")
 
-    if args.batch:  cfg["stage4_look"]["train"]["batch_size"]   = args.batch
-    if args.crop:   cfg["stage4_look"]["train"]["train_size"]   = args.crop
-    if args.lr:     cfg["stage4_look"]["train"]["lr"]           = args.lr
-    if args.lpips:  cfg["stage4_look"]["train"]["lpips_weight"] = args.lpips
+    if args.batch:             cfg["stage4_look"]["train"]["batch_size"]         = args.batch
+    if args.crop:              cfg["stage4_look"]["train"]["train_size"]          = args.crop
+    if args.lr:                cfg["stage4_look"]["train"]["lr"]                  = args.lr
+    if args.lpips:             cfg["stage4_look"]["train"]["lpips_weight"]        = args.lpips
+    if args.mono is not None:  cfg["stage4_look"]["train"]["lambda_monotonicity"] = args.mono
+    if args.tv   is not None:  cfg["stage4_look"]["train"]["lambda_tv"]           = args.tv
 
     train(cfg, epochs=args.epochs, resume=not args.no_resume,
           arch_override=args.arch, out_override=args.out)
