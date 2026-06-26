@@ -121,15 +121,17 @@ class LUTwithBGridModel(nn.Module):
         self.grids = nn.Parameter(
             _identity_grid(n_grid_basis, grid_size, n_grid_channels))
 
-        # ResNet-18 backbone — pretrained ImageNet features for both LUT and grid heads
+        # ResNet-18 backbone — frozen pretrained feature extractor
         import torchvision.models as M
         r = M.resnet18(weights=M.ResNet18_Weights.IMAGENET1K_V1)
         self.backbone = nn.Sequential(*list(r.children())[:-1], nn.Flatten())
+        for p in self.backbone.parameters():
+            p.requires_grad = False   # frozen — prevents overfitting on 65 pairs
         feat_dim = 512
 
-        # Separate heads for LUT vs grid weights
-        self.lut_head  = nn.Sequential(nn.Linear(feat_dim, n_lut_basis), nn.Softmax(dim=1))
-        self.grid_head = nn.Sequential(nn.Linear(feat_dim, n_grid_basis), nn.Softmax(dim=1))
+        # Separate heads with dropout
+        self.lut_head  = nn.Sequential(nn.Dropout(0.3), nn.Linear(feat_dim, n_lut_basis), nn.Softmax(dim=1))
+        self.grid_head = nn.Sequential(nn.Dropout(0.3), nn.Linear(feat_dim, n_grid_basis), nn.Softmax(dim=1))
 
         # 1×1 conv: cat([img(3), local_grid(C)]) → 3
         # Input layout: channels 0-2 = image, channels 3+ = grid features

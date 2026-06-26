@@ -39,8 +39,11 @@ class LUTClassifier(nn.Module):
         if backbone == "resnet18":
             import torchvision.models as M
             r = M.resnet18(weights=M.ResNet18_Weights.IMAGENET1K_V1)
-            # Drop the final FC; keep everything through avgpool
             self.feat = nn.Sequential(*list(r.children())[:-1], nn.Flatten())
+            # Freeze backbone — use as fixed feature extractor.
+            # 11M params on 65 pairs would overfit; only the tiny head trains.
+            for p in self.feat.parameters():
+                p.requires_grad = False
             feat_dim = 512
         else:
             self.feat = nn.Sequential(
@@ -51,7 +54,12 @@ class LUTClassifier(nn.Module):
                 nn.AdaptiveAvgPool2d(1), nn.Flatten(),
             )
             feat_dim = 64
-        self.head = nn.Sequential(nn.Linear(feat_dim, n_out), nn.Softmax(dim=1))
+        # Dropout before head prevents overfitting on the 512-dim bottleneck
+        self.head = nn.Sequential(
+            nn.Dropout(p=0.3),
+            nn.Linear(feat_dim, n_out),
+            nn.Softmax(dim=1),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # ResNet expects at least 224×224; downsample large crops for the backbone
@@ -186,6 +194,8 @@ class SepLUTModel(nn.Module):
             import torchvision.models as M
             r = M.resnet18(weights=M.ResNet18_Weights.IMAGENET1K_V1)
             self.backbone = nn.Sequential(*list(r.children())[:-1], nn.Flatten())
+            for p in self.backbone.parameters():
+                p.requires_grad = False   # frozen feature extractor
             feat_dim = 512
         else:
             self.backbone = nn.Sequential(
@@ -197,8 +207,8 @@ class SepLUTModel(nn.Module):
             )
             feat_dim = 64
         self.backbone_name = backbone
-        self.head_1d = nn.Sequential(nn.Linear(feat_dim, n_1d), nn.Softmax(dim=1))
-        self.head_3d = nn.Sequential(nn.Linear(feat_dim, n_3d), nn.Softmax(dim=1))
+        self.head_1d = nn.Sequential(nn.Dropout(0.3), nn.Linear(feat_dim, n_1d), nn.Softmax(dim=1))
+        self.head_3d = nn.Sequential(nn.Dropout(0.3), nn.Linear(feat_dim, n_3d), nn.Softmax(dim=1))
         self.interp = TrilinearInterp()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
