@@ -13,3 +13,6 @@ build/
 *.so
 *.pyd
 trilinear_cpp/build/
+
+# SAM checkpoint (358 MB — download via zone_seg._download())
+models/sam/*.pth
