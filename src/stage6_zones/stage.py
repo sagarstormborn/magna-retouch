@@ -33,12 +33,12 @@ def process(img: np.ndarray, cfg: dict) -> np.ndarray:
 
     try:
         segmenter = get_segmenter(cfg)
-        zones = segmenter.segment(img)
+        zones, scene_type = segmenter.segment(img)
 
         img_f32 = img.astype(np.float32) / 255.0
-        corrected_f32 = apply_zone_corrections(img_f32, zones, cfg)
+        corrected_f32 = apply_zone_corrections(img_f32, zones, scene_type=scene_type, cfg=cfg)
         result = (np.clip(corrected_f32, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
-        log.info("stage6.done", shape=result.shape)
+        log.info("stage6.done", shape=result.shape, scene_type=scene_type)
         return result
 
     except Exception as e:

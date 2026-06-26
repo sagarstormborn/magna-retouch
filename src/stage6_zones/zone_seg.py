@@ -1,18 +1,21 @@
 """
 SAM ViT-B zone segmenter for real estate photos.
 
-Runs SAM's automatic mask generator then classifies each mask into one of four
-semantic zones using position + colour heuristics tuned for Danish real estate:
-    sky      — overcast/blue upper regions (exterior)
-    floor    — warm lower regions (wood/carpet)
-    windows  — very bright interior rectangles
-    walls    — everything else (main LUT correction zone)
+Runs SAM's automatic mask generator then classifies each mask into semantic zones
+AND classifies the shot as interior or exterior — because the corrections needed
+are fundamentally different:
+
+  Exterior zones: sky, ground/garden, building facade, walls
+  Interior zones: ceiling, windows, floor (wood/carpet), walls
+
+The scene_type drives which correction branch zone_correct.py applies.
+Interior/exterior is determined primarily by sky-zone coverage (>8% = exterior).
 """
 from __future__ import annotations
 
 import urllib.request
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Tuple
 
 import cv2
 import numpy as np
@@ -71,12 +74,14 @@ class ZoneSegmenter:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def segment(self, image_rgb_u8: np.ndarray) -> Dict[str, np.ndarray]:
+    def segment(self, image_rgb_u8: np.ndarray) -> Tuple[Dict[str, np.ndarray], str]:
         """
         Args:
             image_rgb_u8: HxWx3 uint8 RGB
         Returns:
-            dict with keys sky, floor, windows, walls — each HxW bool mask
+            (zones, scene_type) where:
+              zones      — dict with keys sky/ceiling, floor, windows, walls (HxW bool)
+              scene_type — "exterior" | "interior"
         """
         if self._generator is None:
             self._init()
@@ -98,17 +103,25 @@ class ZoneSegmenter:
         sky   = _detect_sky(image_rgb_u8, masks_data, H, W, scale)
         floor = _detect_floor(image_rgb_u8, masks_data, H, W, scale)
         wins  = _detect_windows(image_rgb_u8, masks_data, H, W, scale, exclude=sky)
-
         walls = ~(sky | floor | wins)
+
+        # Interior/exterior: sky > 8% of frame means we're outside
+        sky_coverage = float(sky.mean())
+        scene_type = "exterior" if sky_coverage > 0.08 else "interior"
+
+        # Rename sky → ceiling for interior so corrections know what they're touching
+        sky_or_ceiling_key = "sky" if scene_type == "exterior" else "ceiling"
+        zones = {sky_or_ceiling_key: sky, "floor": floor, "windows": wins, "walls": walls}
 
         log.info(
             "zone_seg.done",
-            sky_pct=round(sky.mean() * 100, 1),
+            scene_type=scene_type,
+            sky_coverage_pct=round(sky_coverage * 100, 1),
             floor_pct=round(floor.mean() * 100, 1),
             windows_pct=round(wins.mean() * 100, 1),
             walls_pct=round(walls.mean() * 100, 1),
         )
-        return {"sky": sky, "floor": floor, "windows": wins, "walls": walls}
+        return zones, scene_type
 
 
 # ── Zone heuristics ───────────────────────────────────────────────────────────

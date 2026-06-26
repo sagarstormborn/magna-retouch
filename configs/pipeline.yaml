@@ -72,15 +72,23 @@ stage5_benchmark:
 stage6_zones:
   enabled: true
   sam_checkpoint: models/sam/sam_vit_b_01ec64.pth
+  # Interior/exterior threshold: sky zone > this fraction → exterior
+  exterior_sky_threshold: 0.08
   corrections:
     blend_sigma: 41              # Gaussian blur px for soft zone boundaries
-    sky_a_shift: 0.0             # Lab a* shift for sky (0 = no hue change)
-    sky_b_shift: -4.0            # Lab b* shift for sky (negative = cooler)
-    sky_highlight_L: 92.0        # L* soft-clip for sky highlights
-    floor_a_shift: 1.0           # slight red push for wood/carpet
-    floor_b_shift: 3.5           # warm yellow for floor tones
-    win_highlight_L: 90.0        # window highlight soft-clip threshold
-    win_clip_range: 15.0         # tanh compression width above threshold
+    # --- EXTERIOR corrections ---
+    sky_a_shift: 0.0             # Lab a* (0 = no hue change)
+    sky_b_shift: -4.0            # Lab b* (negative = cooler — Danish overcast sky)
+    sky_highlight_L: 92.0        # L* soft-clip threshold for sky
+    ground_b_shift: 2.0          # subtle warmth for garden/paving
+    # --- INTERIOR corrections ---
+    ceiling_a_shift: 0.5         # slight red — anchor white ceiling warmth
+    ceiling_b_shift: 2.5         # slight warm — counteract blue LED cast
+    win_highlight_L: 88.0        # interior windows clip earlier (more aggressive)
+    win_clip_range: 12.0         # tanh width for window highlight compression
+    win_desaturate: 0.35         # desaturate blown window pixels
+    floor_a_shift: 1.0           # slight red — wood tones
+    floor_b_shift: 3.5           # warm yellow — wood/carpet
 
 io:
   raw_extensions: [".nef", ".cr2", ".cr3", ".arw", ".dng", ".raf", ".orf", ".rw2"]
