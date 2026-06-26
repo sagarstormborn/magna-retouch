@@ -1,0 +1,7 @@
+{
+  "target_brightness": 0.580595621236623,
+  "brightness_norm": true,
+  "architecture": "lutwithbgrid",
+  "model": "model_best.pth",
+  "note": "regenerated; identical for bgrid_best/seplut_best (same deterministic split)"
+}

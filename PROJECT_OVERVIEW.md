@@ -30,14 +30,13 @@ Matt retouches images manually in **Capture One** and **Photoshop**. The goal is
 | Stage | ΔE2000 | MS-SSIM | Brightness | R/B ratio |
 |---|---|---|---|---|
 | RAW only (no LUT) | 45.6 | 0.32 | 80 | 1.13 |
-| SepLUT (ep203/800, honest val) | **14.35** | — | — | — |
-| LUTwithBGrid (ep182/800, honest val) | **17.53** | — | — | — |
+| **SepLUT Run 7 (honest, held-out TEST)** | **12.73** | — | — | — |
+| LUTwithBGrid Run 7 (honest, held-out TEST) | 14.69 | — | — | — |
 | Matt's own C1 pre-retouch | 14.23 | 0.59 | 117 | 1.13 |
 | **Matt's target** | **0.00** | **1.00** | 159 | 1.05 |
 
-> **Correction:** An earlier figure of ΔE ~14-18 (honest val) was train-set leakage (gold DSCF images were inside the training set).
-> After fixing to a proper held-out split, honest val ΔE is **14-18** at epoch ~200/800 and still dropping.
-> Final held-out TEST ΔE will be updated here when the GPU runs complete (~25 min).
+**SepLUT beats C1 (12.73 vs 14.23) on a genuinely held-out 21-image test set.**
+Next run on 181 pairs (83 more MAGNA LUX in progress) targets ΔE ~9-11.
 
 ---
 
@@ -189,8 +188,8 @@ This is where the most research and iteration happened.
 - R/B ratio: **1.021** ← closer to target 1.049 (was 1.036)
 - MS-SSIM: 0.563
 
-### Run 7: Dual-GPU corrected run (IN PROGRESS — ~25 min remaining)
-**Six correctness fixes applied (code review by parallel agent):**
+### Run 7: Dual-GPU corrected run — ✅ COMPLETE
+**Six correctness fixes applied:**
 1. DSCF gold 21 images held out as TEST — never trained on, never used for model selection
 2. 15% deterministic VAL split from remaining 77 pairs — model saved on best **val ΔE2000**
 3. GFX aspect fix: `_center_crop_to_ar()` instead of stretch-resize → pixels aligned
@@ -198,11 +197,17 @@ This is where the most research and iteration happened.
 5. Brightness norm pinned to `norm.json` sidecar → train ≡ inference
 6. `colour-science` installed on server so val ΔE matches benchmark harness
 
-**Current (ep ~200/800):**
-- GPU0 RTX 3060: LUTwithBGrid, val_ΔE=17.53 ↓
-- GPU1 GTX 1660: SepLUT,      val_ΔE=14.35 ↓
+**Final results (800 epochs, 65 train / 12 val / 21 test held-out):**
 
-**After completion:** winning checkpoint promoted → `model_best.pth`, full TEST ΔE reported here.
+| Model | Val ΔE2000 | **TEST ΔE2000** |
+|---|---|---|
+| SepLUT (GTX 1660) | 12.83 | **12.73** ← winner, promoted |
+| LUTwithBGrid (RTX 3060) | 15.46 | 14.69 |
+
+**Honest TEST ΔE = 12.73** on 21 DSCF images never seen during training.  
+This is the number to show Matt (not 13.15, which was train-set leakage).
+
+**Next: retrain on 181 pairs** (83 more MAGNA LUX being processed now) → expect ΔE to drop to ~9-11.
 
 ### Run 6: LUTwithBGrid, 98 pairs, RTX 3060 (superseded by Run 7)
 - New spatial architecture with bilateral grid slicing
