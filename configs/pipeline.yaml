@@ -27,22 +27,29 @@ stage3_wb:
 
 stage4_look:
   method: lut3d                    # lut3d | hdrnet
-  architecture: seplut             # lut3d | seplut  (seplut = 1D+3D cascade, ECCV 2022)
+  architecture: lutwithbgrid       # lut3d | seplut | lutwithbgrid (spatial corrections)
   lut_size: 33                     # 3D LUT grid size
   lut_1d_size: 64                  # 1D per-channel curve size (seplut only)
-  n_luts: 3                        # basis 3D LUTs (lut3d) / basis 3D LUTs (seplut stage 2)
+  n_luts: 3                        # basis 3D LUTs
   n_1d_luts: 3                     # basis 1D LUTs (seplut only)
-  n_3d_luts: 3                     # alias — same as n_luts for seplut
+  n_3d_luts: 3
+  # LUTwithBGrid-specific
+  n_lut_basis: 3                   # basis 3D LUTs for global grade
+  n_grid_basis: 4                  # basis bilateral grids for spatial correction
+  grid_size: 17                    # bilateral grid resolution
+  n_grid_channels: 3               # per-node channels (3 = additive RGB offset)
   lut_model_path: models/lut3d/model_best.pth
   hdrnet_model_path: models/hdrnet/model_best.pth
   train:
     n_epochs: 400
     lr: 0.0002
-    batch_size: 8                   # 8 on RTX 3060 (12GB); use 4 on CPU/smaller GPU
-    train_size: 480
+    batch_size: 8                   # 8 on RTX 3060 (12GB); 4 on CPU
+    train_size: 640                 # larger crops → longer GPU compute → better utilisation
     lpips_weight: 0.1
     brightness_norm: true
-    target_brightness: 0.605       # Matt's median output brightness (measured from 58 pairs)
+    target_brightness: 0.605
+    lambda_monotonicity: 10.0      # LUTwithBGrid: prevents hue inversion
+    lambda_tv: 0.0001              # LUTwithBGrid: LUT smoothness
 
 stage5_benchmark:
   delta_e_threshold: 2.0           # ΔE2000 target ≲ 2 (Matt criterion 3)

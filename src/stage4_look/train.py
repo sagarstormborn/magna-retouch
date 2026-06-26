@@ -25,6 +25,7 @@ import structlog
 from src.common.config import load_config
 from src.common.logging import setup_logging
 from .lut3d import build_model
+from .lut_bilateral import monotonicity_loss, tv_loss
 
 log = structlog.get_logger(__name__)
 
@@ -217,6 +218,16 @@ def train(cfg: dict, epochs: int | None = None, resume: bool = True):
             inp, tgt = inp.to(device), tgt.to(device)
             pred = model(inp)
             loss = loss_fn(pred, tgt)
+
+            # Regularisation for LUTwithBGrid — keeps LUT smooth and monotone
+            if hasattr(model, "luts_3d"):
+                lam_mono = tr.get("lambda_monotonicity", 0.0)
+                lam_tv   = tr.get("lambda_tv", 0.0)
+                if lam_mono > 0:
+                    loss = loss + lam_mono * monotonicity_loss(model.luts_3d)
+                if lam_tv > 0:
+                    loss = loss + lam_tv * tv_loss(model.luts_3d)
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()

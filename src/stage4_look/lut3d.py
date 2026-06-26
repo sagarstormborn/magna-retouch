@@ -203,6 +203,9 @@ def build_model(cfg: dict) -> nn.Module:
             lut_1d_size=s4.get("lut_1d_size", 64),
             lut_3d_size=s4.get("lut_size", 33),
         )
+    if arch == "lutwithbgrid":
+        from .lut_bilateral import build_bilateral_model
+        return build_bilateral_model(cfg)
     return AdaptiveLUT3DModel(
         n_luts=s4.get("n_luts", 3),
         lut_size=s4.get("lut_size", 33),
