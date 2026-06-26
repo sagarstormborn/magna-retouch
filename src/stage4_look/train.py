@@ -187,8 +187,11 @@ def train(cfg: dict, epochs: int | None = None, resume: bool = True):
     brightness_norm = tr.get("brightness_norm", True)
     ds = PairDataset(Path("data/train/our_input"), Path("data/train/our_target"),
                      crop_size=crop_size, augment=True, brightness_norm=brightness_norm)
+    import torch.cuda
+    n_workers = 4 if torch.cuda.is_available() else 0   # parallel IO on GPU, sync on CPU
+    pin = torch.cuda.is_available()
     dl = DataLoader(ds, batch_size=batch_size, shuffle=True,
-                    num_workers=0, pin_memory=False)
+                    num_workers=n_workers, pin_memory=pin, persistent_workers=n_workers > 0)
 
     # Model — selected by config
     model = build_model(cfg).to(device)

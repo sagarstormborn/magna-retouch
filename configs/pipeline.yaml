@@ -38,7 +38,7 @@ stage4_look:
   train:
     n_epochs: 400
     lr: 0.0002
-    batch_size: 4
+    batch_size: 8                   # 8 on RTX 3060 (12GB); use 4 on CPU/smaller GPU
     train_size: 480
     lpips_weight: 0.1
     brightness_norm: true
