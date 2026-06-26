@@ -69,6 +69,19 @@ stage5_benchmark:
       - Autoenhance
       - "Matt's Reference"
 
+stage6_zones:
+  enabled: true
+  sam_checkpoint: models/sam/sam_vit_b_01ec64.pth
+  corrections:
+    blend_sigma: 41              # Gaussian blur px for soft zone boundaries
+    sky_a_shift: 0.0             # Lab a* shift for sky (0 = no hue change)
+    sky_b_shift: -4.0            # Lab b* shift for sky (negative = cooler)
+    sky_highlight_L: 92.0        # L* soft-clip for sky highlights
+    floor_a_shift: 1.0           # slight red push for wood/carpet
+    floor_b_shift: 3.5           # warm yellow for floor tones
+    win_highlight_L: 90.0        # window highlight soft-clip threshold
+    win_clip_range: 15.0         # tanh compression width above threshold
+
 io:
   raw_extensions: [".nef", ".cr2", ".cr3", ".arw", ".dng", ".raf", ".orf", ".rw2"]
   output_format: tiff              # tiff | jpeg

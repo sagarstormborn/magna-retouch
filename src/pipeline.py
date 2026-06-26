@@ -118,6 +118,7 @@ def _process_group(group_name: str, paths: list[Path], output_dir: Path, cfg: di
     from src.stage2_hdr.stage import process as s2
     from src.stage3_wb.stage import process_single as s3
     from src.stage4_look.stage import process as s4
+    from src.stage6_zones.stage import process as s6
 
     log.info("pipeline.group_start", group=group_name, n_brackets=len(paths))
 
@@ -137,10 +138,13 @@ def _process_group(group_name: str, paths: list[Path], output_dir: Path, cfg: di
 
     # Stage 4: look (skipped if model not trained yet)
     try:
-        final = s4(wb_img, cfg)
+        lut_img = s4(wb_img, cfg)
     except FileNotFoundError as e:
         log.warning("pipeline.stage4_skipped", reason=str(e))
-        final = wb_img
+        lut_img = wb_img
+
+    # Stage 6: SAM zone segmentation + per-zone corrections
+    final = s6(lut_img, cfg)
 
     out_path = output_dir / f"{group_name}.tiff"
     save_tiff_16(out_path, final)

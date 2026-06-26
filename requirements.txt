@@ -35,6 +35,10 @@ structlog==24.2.0
 # Visualisation / contact sheets
 matplotlib==3.9.0
 
+# Zone segmentation (Stage 6)
+# Install via: pip install git+https://github.com/facebookresearch/segment-anything.git
+# segment-anything (pinned via git, see above)
+
 # Dev / test
 pytest==8.2.2
 pytest-cov==5.0.0
