@@ -1,0 +1,10 @@
+# Minimal deps for Stage 4 GPU training only (no RAW processing needed on training server)
+# Install torch separately first:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+torch
+torchvision
+opencv-python
+lpips
+PyYAML
+structlog
+tqdm

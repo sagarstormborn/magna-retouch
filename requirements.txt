@@ -5,7 +5,7 @@ opencv-python==4.9.0.80
 Pillow==10.3.0
 
 # Lens correction
-lensfunpy==1.13.0
+lensfunpy>=1.14.0
 
 # Colour science / metrics
 colour-science==0.4.4
